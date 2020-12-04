@@ -36,6 +36,10 @@ precision highp float;
 // Set to 1 to use a procedural checker environment (useful for local testing)
 #define PROCEDURAL_ENV 1
 
+// Conductor Fresnel values for sheen
+#define SHEEN_N 2.9114
+#define SHEEN_K 3.0893
+
 // color conversion
 vec3 srgb_from_rgb(vec3 rgb) {
 	vec3 a = vec3(0.055, 0.055, 0.055);
@@ -178,17 +182,23 @@ struct VRayMtlInitParams {
 	float sssScatterCoeff;
 	float thickness;
 	float distToCamera;
+	vec3 sheenColor;
+	float sheenAmount;
+	float sheenGlossiness;
+	vec3 coatColor;
+	float coatAmount;
+	float coatGlossiness;
+	float coatIOR;
 };
 
 struct VRayMtlContext {
 	vec3 geomNormal;
 	float gloss1;
-	float gloss2;
+	float roughnessSqr;
 	float reflGloss;
 	vec3 e;
 	vec3 diff;
 	float fresnel;
-	vec3 reflNoFresnel;
 	vec3 refl;
 	vec3 refr;
 	vec3 illum;
@@ -199,6 +209,13 @@ struct VRayMtlContext {
 	float fragmentNoise; // per-fragment noise value
 	mat3 nm;
 	mat3 inm;
+	vec3 sheen;
+	bool hasSheen;
+	float sheenGloss;
+	vec3 coat;
+	mat3 coatNM;
+	float coatRoughnessSqr;
+	bool hasCoat;
 };
 
 vec3 sampleBRDF(VRayMtlInitParams params, VRayMtlContext ctx,
@@ -210,11 +227,14 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams);
 
 vec3 computeDirectDiffuseContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir);
 vec3 computeDirectReflectionContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir);
+vec3 computeDirectSheenContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir);
+vec3 computeDirectCoatContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir);
 
 vec3 computeIndirectDiffuseContribution(VRayMtlInitParams params, VRayMtlContext ctx);
 vec3 computeIndirectReflectionContribution(VRayMtlInitParams params, VRayMtlContext ctx);
-vec3 computeIndirectRefractionContribution(
-	VRayMtlInitParams params, VRayMtlContext ctx, float alpha, vec3 alphaDir);
+vec3 computeIndirectRefractionContribution(VRayMtlInitParams params, VRayMtlContext ctx, float alpha, vec3 alphaDir);
+vec3 computeIndirectSheenContribution(VRayMtlInitParams params, VRayMtlContext ctx);
+vec3 computeIndirectCoatContribution(VRayMtlInitParams params, VRayMtlContext ctx);
 
 vec3 computeRefractFogContrib(VRayMtlInitParams params, VRayMtlContext ctx, vec3 diffuseContrib);
 
@@ -250,6 +270,10 @@ vec3 whiteComplement(vec3 x) {
 
 // }}} end utility functions
 
+/// Compute the two orthogonal vectors to a given input vector
+/// @param n Input vector
+/// @param[out] u The first orthogonal vector
+/// @param[out] v The second orthogonal vector
 void computeTangentVectors(vec3 n, out vec3 u, out vec3 v) {
 	// It doesn't matter what these vectors are, the result vectors just need to be perpendicular to the normal and to
 	// each other
@@ -260,11 +284,20 @@ void computeTangentVectors(vec3 n, out vec3 u, out vec3 v) {
 	v = normalize(cross(n, u));
 }
 
+/// Make an orthogonal matrix given a surface normal
+/// @param n The normal vector
+/// @param[out] m The output orthogonal matrix with n in the third column
 void makeNormalMatrix(in vec3 n, out mat3 m) {
 	computeTangentVectors(n, m[0], m[1]);
 	m[2] = n;
 }
 
+/// Get the Fresnel reflectance for a dielectric.
+/// @param fresnelIOR Surface index of refraction
+/// @param e View direction
+/// @param n Surface normal
+/// @param refractDir Refracted view direction
+/// @return Fresnel reflectance
 float getFresnelCoeff(float fresnelIOR, vec3 e, vec3 n, vec3 refractDir) {
 	if (abs(fresnelIOR - 1.0) < 1e-6)
 		return 0.0;
@@ -286,6 +319,25 @@ float getFresnelCoeff(float fresnelIOR, vec3 e, vec3 n, vec3 refractDir) {
 	float Fp = fp2 * fp2;
 
 	return 0.5 * (Fs + Fp);
+}
+
+/// Get the Fresnel reflectance for a conductor.
+/// Accurate values for n and k can be obtained from https://refractiveindex.info/
+/// For some conductors the n and k parameters vary with the light wavelength so the
+/// Fresnel reflectance should be computed separately for R,G and B.
+/// @param cosTheta Cosine of the angle between the view direction and the normal
+/// @param n Refractive index
+/// @param k Extinction coefficient
+/// @return Fresnel reflectance.
+float getConductorFresnel(float cosTheta, float n, float k) {
+	float c2 = cosTheta * cosTheta;
+	float n2k2 = n * n + k * k;
+	float nc2 = 2.0f * n * cosTheta;
+	float rsa = n2k2 + c2;
+	float rpa = n2k2 * c2 + 1.0f;
+	float rs = (rsa - nc2) / (rsa + nc2);
+	float rp = (rpa - nc2) / (rpa + nc2);
+	return 0.5f * (rs + rp);
 }
 
 vec3 getSpecularDir(float u, float v, float k) {
@@ -318,6 +370,13 @@ vec3 getBlinnDir(float uc, float vc, float glossiness, vec3 view, mat3 nm) {
 vec3 getSphereDir(float u, float v) {
 	float thetaSin = u;
 	float thetaCos = sqrt(1.0 - thetaSin * thetaSin);
+	float phi = 2.0 * PI * v;
+	return vec3(cos(phi) * thetaCos, sin(phi) * thetaCos, thetaSin);
+}
+
+vec3 getDiffuseDir(float u, float v) {
+	float thetaSin = sqrt(u);
+	float thetaCos = sqrt(1.0 - u);
 	float phi = 2.0 * PI * v;
 	return vec3(cos(phi) * thetaCos, sin(phi) * thetaCos, thetaSin);
 }
@@ -650,10 +709,27 @@ vec3 sampleBRDF(
 	} else if (brdfType == 1) {
 		dir = getBlinnDir(u, v, ctx.gloss1, -ctx.e, ctx.nm);
 	} else if (brdfType == 2) {
-		dir = getWardDir(u, v, ctx.gloss2, -ctx.e, ctx.nm);
+		dir = getWardDir(u, v, ctx.roughnessSqr, -ctx.e, ctx.nm);
 	} else /* brdfType==3 */ {
-		dir = getGGXDir(u, v, ctx.gloss2, ctx.gtrGamma, -ctx.e, ctx.nm, rayProb, brdfContrib);
+		dir = getGGXDir(u, v, ctx.roughnessSqr, ctx.gtrGamma, -ctx.e, ctx.nm, rayProb, brdfContrib);
 	}
+
+	if (dot(dir, geomNormal) < 0.0) {
+		brdfContrib = 0.0;
+	}
+	return dir;
+}
+
+vec3 sampleCoatBRDF(
+	VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
+	vec3 geomNormal = params.geomNormal;
+	vec2 uv = rand(ctx, sampleIdx, nbSamples);
+	float u = uv.x, v = uv.y;
+
+	vec3 dir = vec3(0.0);
+	rayProb = 1.0;
+	brdfContrib = 1.0;
+	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, rayProb, brdfContrib);
 
 	if (dot(dir, geomNormal) < 0.0) {
 		brdfContrib = 0.0;
@@ -686,8 +762,221 @@ vec3 sampleRefractBRDF(
 	return m * sampleDir;
 }
 
+/// Sheen BRDF functions based on the Production Friendly Microfacet Sheen BRDF paper
+/// Implementation of the curve fitting polynomial (Table 1 and Section 3)
+float sheenP(float a, float b, float c, float d, float e, float x) {
+	return a / (1.0 + b * pow(x, c)) + d * x + e;
+}
+
+/// Implementation of the lambda curve fitting and interpolation (Table 1 and Section 3)
+float sheenL(float x, float roughness) {
+	float a0 = 25.3245;
+	float b0 = 3.32435;
+	float c0 = 0.16801;
+	float d0 = -1.27393;
+	float e0 = -4.85967;
+	float a1 = 21.5473;
+	float b1 = 3.82987;
+	float c1 = 0.19823;
+	float d1 = -1.97760;
+	float e1 = -4.32054;
+
+	float t = (1.0 - roughness) * (1.0 - roughness);
+	float p0 = sheenP(a0, b0, c0, d0, e0, x);
+	float p1 = sheenP(a1, b1, c1, d1, e1, x);
+	return t * p0 + (1.0 - t) * p1;
+}
+
+/// Implementation of the lambda term (Section 3)
+float sheenLambda(float cosTheta, float roughness) {
+	if (cosTheta < 0.5) {
+		return exp(sheenL(cosTheta, roughness));
+	} else {
+		return exp(2.0 * sheenL(0.5, roughness) - sheenL(1.0 - cosTheta, roughness));
+	}
+}
+
+/// Implementation of the full shadowing term (Section 3 and Section 4)
+float sheenShadowingMasking(float cosIN, float cosON, float roughness) {
+	float c1 = 1.0 - cosON;
+	float c2 = c1 * c1;
+	float c4 = c2 * c2;
+	float c8 = c4 * c4;
+	float lambdaON = pow(sheenLambda(cosON, roughness), 1.0 + 2.0 * c8);
+	float lambdaIN = sheenLambda(cosIN, roughness);
+	return 1.0 / (1.0 + lambdaIN + lambdaON);
+}
+
+/// Implementation of the full sheen BRDF including the cos(N,L) multiplication and 
+/// VRay's probability transformation (2pi multiplication)
+/// Glossiness must be in the [0, 1) range. In theory the result is undefined for glossiness = 1
+/// but in practice the highlight disappears and we check for that as soon as we read the glossiness texture.
+float sheenProbability(vec3 viewDir, vec3 lightDir, vec3 normal, float glossiness) {
+	vec3 incomingDir = -viewDir;
+
+	float cosIN = min(1.0, dot(incomingDir, normal));
+	float cosON = min(1.0, dot(lightDir, normal));
+	if (cosIN <= 1e-6 || cosON <= 1e-6)
+		return 0.0;
+
+	float roughness = 1.0 - glossiness;
+	vec3 halfVector = normalize(lightDir - viewDir);
+
+	float cosTheta = clamp(dot(halfVector, normal), 0.0, 1.0);
+	// This should be fine because we expect theta in [0, pi/2] range and both 
+	// sin(theta) and cos(theta) are non-negative in this case
+	float sinThetaSq = clamp(1.0 - cosTheta * cosTheta, 0.0, 1.0);
+	// Compute the microfacet distribution (Section 2)
+	// The 2pi divide is cancelled by VRay's probability transformation
+	float invRoughness = 1.0 / roughness;
+	float D = (2.0 + invRoughness) * pow(sinThetaSq, 0.5 * invRoughness);
+	float G = sheenShadowingMasking(cosIN, cosON, roughness);
+	// cosON divide will be cancelled by cosON multiplication later so just skip both.
+	float res = 0.25 * D * G / cosIN;
+	return res;
+}
+
+/// Size of the sheen albedo LUT
+#define SHEEN_LUT_SIZE 16
+
+/// Directional sheen albedo LUT where the row index corresponds to roughness and the column index corresponds to cosTheta
+/// Conductor Fresnel for wavelength 650nm with n=2.9114 and k=3.0893 (Iron) is used instead of the usual dielectric Fresnel.
+/// Conductor Fresnel inputs taken from https://refractiveindex.info/
+/// It's computed according to Section 2.1.5. in the paper
+/// "A Microfacet Based Coupled Specular-Matte BRDF Model with Importance Sampling"
+float sheenAlbedoLUT[SHEEN_LUT_SIZE * SHEEN_LUT_SIZE] = float[] (
+	0.64503, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000,
+	0.44977, 0.26630, 0.18104, 0.12713, 0.08979, 0.06302, 0.04360, 0.02954, 0.01947, 0.01245, 0.00762, 0.00438, 0.00229, 0.00103, 0.00035, 0.00005,
+	0.38310, 0.26927, 0.20305, 0.15812, 0.12440, 0.09790, 0.07660, 0.05932, 0.04531, 0.03419, 0.02527, 0.01810, 0.01234, 0.00780, 0.00429, 0.00170,
+	0.36921, 0.27749, 0.21857, 0.17769, 0.14612, 0.12046, 0.09902, 0.08085, 0.06543, 0.05263, 0.04182, 0.03255, 0.02453, 0.01759, 0.01161, 0.00650,
+	0.37188, 0.28926, 0.23348, 0.19442, 0.16387, 0.13861, 0.11709, 0.09843, 0.08221, 0.06847, 0.05657, 0.04605, 0.03662, 0.02811, 0.02040, 0.01344,
+	0.38180, 0.30284, 0.24825, 0.20989, 0.17968, 0.15446, 0.13273, 0.11365, 0.09683, 0.08242, 0.06979, 0.05843, 0.04806, 0.03849, 0.02961, 0.02137,
+	0.39514, 0.31710, 0.26267, 0.22437, 0.19410, 0.16870, 0.14666, 0.12715, 0.10981, 0.09488, 0.08168, 0.06971, 0.05867, 0.04836, 0.03868, 0.02957,
+	0.40983, 0.33122, 0.27639, 0.23780, 0.20725, 0.18153, 0.15912, 0.13919, 0.12140, 0.10601, 0.09236, 0.07993, 0.06839, 0.05755, 0.04731, 0.03762,
+	0.42452, 0.34459, 0.28906, 0.25001, 0.21907, 0.19299, 0.17020, 0.14987, 0.13168, 0.11592, 0.10191, 0.08911, 0.07719, 0.06598, 0.05535, 0.04527,
+	0.43822, 0.35667, 0.30038, 0.26082, 0.22948, 0.20304, 0.17990, 0.15923, 0.14070, 0.12464, 0.11035, 0.09727, 0.08509, 0.07361, 0.06272, 0.05239,
+	0.45014, 0.36703, 0.31005, 0.27004, 0.23836, 0.21161, 0.18820, 0.16726, 0.14848, 0.13220, 0.11771, 0.10444, 0.09208, 0.08043, 0.06937, 0.05890,
+	0.45964, 0.37532, 0.31783, 0.27751, 0.24559, 0.21866, 0.19507, 0.17397, 0.15503, 0.13861, 0.12400, 0.11064, 0.09818, 0.08643, 0.07530, 0.06476,
+	0.46621, 0.38123, 0.32352, 0.28309, 0.25111, 0.22412, 0.20048, 0.17933, 0.16034, 0.14389, 0.12926, 0.11587, 0.10340, 0.09164, 0.08050, 0.06997,
+	0.46947, 0.38454, 0.32698, 0.28669, 0.25484, 0.22796, 0.20442, 0.18335, 0.16443, 0.14805, 0.13348, 0.12016, 0.10775, 0.09606, 0.08499, 0.07452,
+	0.46915, 0.38511, 0.32810, 0.28824, 0.25674, 0.23016, 0.20687, 0.18602, 0.16730, 0.15109, 0.13670, 0.12353, 0.11127, 0.09971, 0.08876, 0.07842,
+	0.46510, 0.38285, 0.32683, 0.28769, 0.25679, 0.23070, 0.20784, 0.18736, 0.16896, 0.15304, 0.13891, 0.12599, 0.11395, 0.10260, 0.09184, 0.08168
+);
+
+/// Average sheen albedo LUT used to normalize the diffuse scaling factor.
+/// Each element corresponds to a roughness value.
+/// Check Section 2.2. in the paper "A Microfacet Based Coupled Specular-Matte BRDF Model with Importance Sampling"
+/// The LUT stores 1 - average albedo as a small optimization for the renderer
+float sheenAlbedoAvg[SHEEN_LUT_SIZE] = float[] (
+	1.00000,
+	0.97841,
+	0.96276,
+	0.94874,
+	0.93569,
+	0.92349,
+	0.91217,
+	0.90178,
+	0.89235,
+	0.88392,
+	0.87652,
+	0.87017,
+	0.86488,
+	0.86065,
+	0.85749,
+	0.85538
+);
+
+/// Sample the sheen albedo LUT for a given incident angle and glossiness
+/// @param cosTheta Cosine of the angle between the incident direction and the surface normal
+/// @param glossiness Sheen glossiness
+/// @return Directional sheen albedo for the given incident angle and glossiness.
+float sheenDirectionalAlbedo(float cosTheta, float glossiness) {
+	float roughness = (1.0 - glossiness);
+	float x = cosTheta * float(SHEEN_LUT_SIZE - 1);
+	float y = roughness * float(SHEEN_LUT_SIZE - 1);
+	int ix = int(x);
+	int iy = int(y);
+	int ix2 = clamp(ix + 1, 0, SHEEN_LUT_SIZE - 1);
+	int iy2 = clamp(iy + 1, 0, SHEEN_LUT_SIZE - 1);
+	float fx = x - float(ix);
+	float fy = y - float(iy);
+
+	float v1 = (1.0 - fx) * sheenAlbedoLUT[iy  * SHEEN_LUT_SIZE + ix] + fx * sheenAlbedoLUT[iy  * SHEEN_LUT_SIZE + ix2];
+	float v2 = (1.0 - fx) * sheenAlbedoLUT[iy2 * SHEEN_LUT_SIZE + ix] + fx * sheenAlbedoLUT[iy2 * SHEEN_LUT_SIZE + ix2];
+	float albedo = (1.0 - fy) * v1 + fy * v2;
+
+	return clamp(albedo, 0.0, 1.0);
+}
+
+/// Sample the average sheen albedo from the LUT for a given glossiness value
+/// @param glossiness Sheen glossiness
+/// @return Average sheen albedo for the given glossiness
+float getSheenAlbedoAverage(float glossiness) {
+	float roughness = 1.0 - glossiness;
+	float y = roughness * float(SHEEN_LUT_SIZE - 1);
+	int iy0 = int(y);
+	int iy1 = clamp(iy0 + 1, 0, SHEEN_LUT_SIZE - 1);
+	float fy = y - float(iy0);
+	float avg0 = sheenAlbedoAvg[iy0];
+	float avg1 = sheenAlbedoAvg[iy1];
+	float albedoAvg = (1.0 - fy) * avg0 + fy * avg1;
+	return albedoAvg;
+}
+
+/// Get the partial sheen albedo scaling factor (without the view direction albedo).
+/// Used to dim the diffuse according to section 2.2. in the paper
+/// "A Microfacet Based Coupled Specular-Matte BRDF Model with Importance Sampling"
+/// The light direction albedo needs to be computed per light direction but
+/// the view direction albedo can be computed earlier and used to split the samples 
+/// between the diffuse and the sheen layer.
+/// @param sheenColor Sheen color
+/// @param cosTheta Cosine of the angle between the light direction and the normal
+/// @param glossiness Sheen glossiness
+/// @return Partial albedo scaling factor
+vec3 getSheenAlbedoLightDim(vec3 sheenColor, float cosTheta, float glossiness) {
+	float albedoLight = sheenDirectionalAlbedo(max(0.0, cosTheta), glossiness);
+	float avgAlbedo = getSheenAlbedoAverage(glossiness); // This is 1 - average albedo
+	// No need to check the divisor because it's always large enough for this BRDF
+	return (1.0 - sheenColor * albedoLight) / avgAlbedo;
+}
+
+vec3 sampleSheenBRDF(VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
+	// Sample the hemisphere uniformly
+	mat3 localToWorld;
+	makeNormalMatrix(ctx.geomNormal, localToWorld);
+	vec2 uv = rand(ctx, sampleIdx, nbSamples);
+	vec3 dir = localToWorld * getSphereDir(uv.x, uv.y);
+	rayProb = INV_2PI;
+	float glossyFresnelCoeff = getConductorFresnel(-dot(ctx.e, normalize(dir - ctx.e)), SHEEN_N, SHEEN_K);
+	brdfContrib = sheenProbability(ctx.e, dir, ctx.geomNormal, ctx.sheenGloss);
+	brdfContrib *= glossyFresnelCoeff;
+	return dir;
+}
+
+vec3 sampleDiffuseBRDF(VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
+	// Sample the hemisphere with cosine distribution
+	mat3 localToWorld;
+	makeNormalMatrix(ctx.geomNormal, localToWorld);
+	vec2 uv = rand(ctx, sampleIdx, nbSamples);
+	vec3 dir = localToWorld * getDiffuseDir(uv.x, uv.y);
+	rayProb = INV_2PI;
+	brdfContrib = 1.0;
+	return dir;
+}
+
 float pow35(float x) {
 	return x * x * x * sqrt(x);
+}
+
+/// Blend between a metal color and reflection color based on a dielectric Fresnel value
+/// This approximates the tinted reflection visible in some conductors
+/// @param metalColor Metallic color, currently derived from the diffuse (base) color and the metalness value.
+/// @param reflectionColor The color of the specular highlight
+/// @param fresnel Dielectric fresnel coefficient
+/// @return Blended reflection color.
+vec3 computeMetallicReflection(vec3 metalColor, vec3 reflectionColor, float fresnel) {
+	vec3 reflectionDim = reflectionColor * fresnel;
+	return metalColor * (1.0 - reflectionDim) + reflectionDim;
 }
 
 VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
@@ -717,14 +1006,20 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	bool useRoughness = initParams.useRoughness;
 	float gtrGamma = initParams.gtrGamma;
 	int brdfType = initParams.brdfType;
+	float sheenGloss = initParams.sheenGlossiness;
+	float coatGloss = initParams.coatGlossiness;
 
 	VRayMtlContext result;
 	if (initParams.lockFresnelIOR)
 		initParams.fresnelIOR = initParams.refractionIOR;
 
 	result.e = -normalize(Vw);
-	if (useRoughness)
-		reflGloss = 1.0 - reflGloss; // Invert glossiness (turn it into roughness)
+	 // Invert glossiness (turn it into roughness)
+	if (useRoughness) {
+		reflGloss = 1.0 - reflGloss;
+		coatGloss = 1.0 - coatGloss;
+		sheenGloss = 1.0 - sheenGloss;
+	}
 
 	result.reflGloss = reflGloss;
 	result.opacity = opacity;
@@ -757,12 +1052,12 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 		internalReflection = true;
 		refractDir = reflectDir;
 	}
-	result.fresnel = 1.0;
+	float fresnel = 1.0;
 	if (useFresnel && !internalReflection)
-		result.fresnel = clamp(getFresnelCoeff(fresnelIOR, result.e, normal, refractDir), 0.0, 1.0);
+		fresnel = clamp(getFresnelCoeff(fresnelIOR, result.e, normal, refractDir), 0.0, 1.0);
 
-	result.reflNoFresnel = reflColor * reflAmount * result.opacity;
-	result.refl = result.reflNoFresnel * result.fresnel;
+	vec3 reflNoFresnel = reflColor * reflAmount * result.opacity;
+	result.refl = reflNoFresnel * fresnel;
 
 	// Reflection calculation including metalness. Taken from VRayMtl's original implementation.
 	vec3 metalColor = result.diff * metalness;
@@ -776,11 +1071,38 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	}
 	result.diff *= reflectionTransparency - result.refr;
 
-	result.refl = mix(metalColor, result.reflNoFresnel, result.fresnel);
+	result.refl = computeMetallicReflection(metalColor, reflNoFresnel, fresnel);
+
+	vec3 sheenColor = initParams.sheenColor * initParams.sheenAmount;
+	result.hasSheen = ((sheenColor.x + sheenColor.y + sheenColor.z) > 1e-6) && (1.0 - sheenGloss > 1e-5);
+	if (result.hasSheen) {
+		float albedoView = sheenDirectionalAlbedo(max(0.0, dot(-result.e, geomNormal)), sheenGloss);
+		vec3 sheenViewDim = 1.0 - initParams.sheenColor * albedoView;
+		result.diff *= sheenViewDim;
+		result.sheen = initParams.sheenColor * (reflectionTransparency - result.refr);
+	}
+
+	result.hasCoat = (initParams.coatAmount > 1e-6);
+	if (result.hasCoat && !internalReflection) {
+		float coatFresnel = clamp(getFresnelCoeff(initParams.coatIOR, result.e, normal, refractDir), 0.0, 1.0);
+		float coatAmount = initParams.coatAmount;
+		vec3 coatColor = initParams.coatColor * (1.0 - coatFresnel);
+		vec3 coatDim = traceReflections ? ((1.0 - coatAmount) + coatAmount * coatColor) : vec3(1.0);
+		// Dim all layers below the coat
+		result.refl *= coatDim;
+		result.refr *= coatDim;
+		result.sheen *= coatDim;
+		result.diff *= coatDim;
+		makeNormalMatrix(geomNormal, result.coatNM);
+		result.coat = vec3(1.0) * initParams.coatAmount * coatFresnel;
+	}
 
 	result.gloss1 = max(0.0, 1.0 / pow35(max(1.0 - reflGloss, 1e-4)) - 1.0); // [0, 1] -> [0, inf)
-	result.gloss2 = max(1.0 - reflGloss, 1e-4);
-	result.gloss2 *= result.gloss2;
+	result.roughnessSqr = max(1.0 - reflGloss, 1e-4);
+	result.roughnessSqr *= result.roughnessSqr;
+	result.coatRoughnessSqr = max(1.0 - coatGloss, 1e-4);
+	result.coatRoughnessSqr *= result.coatRoughnessSqr;
+	result.sheenGloss = sheenGloss;
 	result.gtrGamma = gtrGamma;
 
 	// Set up the normal/inverse normal matrices for BRDFs that support anisotropy
@@ -827,10 +1149,12 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	return result;
 }
 
+/// Lambertian BRDF contribution
 vec3 vrayMtlDiffuse(vec3 lightDir, vec3 normal) {
 	return vec3(max(0.0, dot(lightDir, normal)));
 }
 
+/// Oren-Nayar BRDF contribution
 vec3 vrayMtlDiffuseRoughness(vec3 lightDir, VRayMtlContext ctx) {
 	float lightNdotL = max(0.0, dot(lightDir, ctx.geomNormal));
 	float rmult = 1.0;
@@ -852,6 +1176,7 @@ vec3 vrayMtlDiffuseRoughness(vec3 lightDir, VRayMtlContext ctx) {
 	return vec3(lightNdotL * rmult);
 }
 
+/// Blinn BRDF contribution
 vec3 vrayMtlBlinn(vec3 lightDir, VRayMtlContext ctx) {
 	float k = max(0.0, ctx.gloss1);
 	vec3 hw = lightDir - ctx.e;
@@ -870,6 +1195,7 @@ vec3 vrayMtlBlinn(vec3 lightDir, VRayMtlContext ctx) {
 	return vec3(0.0);
 }
 
+/// Phong BRDF contribution
 vec3 vrayMtlPhong(vec3 lightDir, VRayMtlContext ctx) {
 	vec3 reflectDir = reflect(ctx.e, ctx.geomNormal);
 	float cs1 = dot(lightDir, reflectDir);
@@ -885,6 +1211,7 @@ vec3 vrayMtlPhong(vec3 lightDir, VRayMtlContext ctx) {
 	return vec3(0.0);
 }
 
+/// Ward BRDF contribution
 vec3 vrayMtlWard(vec3 lightDir, VRayMtlContext ctx) {
 	float cs1 = -dot(ctx.e, ctx.geomNormal);
 	float lightNdotL = dot(ctx.geomNormal, lightDir);
@@ -893,8 +1220,8 @@ vec3 vrayMtlWard(vec3 lightDir, VRayMtlContext ctx) {
 		vec3 hn = normalize(ctx.inm * hw);
 		if (hn.z > 1e-3) {
 			float tanhSqr = (1.0 / (hn.z * hn.z) - 1.0);
-			float divd = cs1 * ctx.gloss2;
-			float k = exp(-tanhSqr / ctx.gloss2) / divd;
+			float divd = cs1 * ctx.roughnessSqr;
+			float k = exp(-tanhSqr / ctx.roughnessSqr) / divd;
 			k *= lightNdotL;
 			if (k > 0.0)
 				return vec3(k);
@@ -903,6 +1230,7 @@ vec3 vrayMtlWard(vec3 lightDir, VRayMtlContext ctx) {
 	return vec3(0.0);
 }
 
+/// GTR BRDF contribution
 vec3 vrayMtlGGX(vec3 lightDir, VRayMtlContext ctx) {
 	float cs1 = -dot(ctx.e, ctx.geomNormal);
 	float lightNdotL = dot(ctx.geomNormal, lightDir);
@@ -910,14 +1238,32 @@ vec3 vrayMtlGGX(vec3 lightDir, VRayMtlContext ctx) {
 		vec3 hw = normalize(lightDir - ctx.e);
 		vec3 hn = normalize(ctx.inm * hw);
 		if (hn.z > 1e-3) {
-			float D = getGGXMicrofacetDistribution(hn.z, ctx.gloss2, ctx.gtrGamma);
+			float D = getGGXMicrofacetDistribution(hn.z, ctx.roughnessSqr, ctx.gtrGamma);
 			float G =
-				getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.gloss2, ctx.gtrGamma);
-			float cs2 = max(dot(hw, lightDir), 0.0001);
+				getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.roughnessSqr, ctx.gtrGamma);
 			vec3 micron = ctx.nm * hn;
 			float L2 = dot(micron, micron);
 			float anisotropyCorrection = L2 * sqrt(L2);
-			float k = 0.25 * D * G * anisotropyCorrection / cs1; // anisotropy correction
+			float k = 0.25 * D * G * anisotropyCorrection * PI / cs1; // anisotropy correction
+			if (k > 0.0)
+				return vec3(k);
+		}
+	}
+	return vec3(0.0);
+}
+
+/// GGX BRDF contribution that uses the coat layer parameters
+vec3 vrayMtlGGXCoat(vec3 lightDir, VRayMtlContext ctx) {
+	float cs1 = -dot(ctx.e, ctx.geomNormal);
+	float lightNdotL = dot(ctx.geomNormal, lightDir);
+	if (lightNdotL > 1e-6 && cs1 > 1e-6) {
+		vec3 hw = normalize(lightDir - ctx.e);
+		vec3 hn = normalize(ctx.inm * hw);
+		if (hn.z > 1e-3) {
+			float D = getGGXMicrofacetDistribution(hn.z, ctx.coatRoughnessSqr, 2.0);
+			float G = getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.coatRoughnessSqr, 2.0);
+			vec3 micron = ctx.coatNM * hn;
+			float k = 0.25 * D * G * PI / cs1;
 			if (k > 0.0)
 				return vec3(k);
 		}
@@ -952,6 +1298,11 @@ vec3 computeDirectDiffuseContribution(VRayMtlInitParams params, VRayMtlContext c
 		res = vrayMtlDiffuseRoughness(lightDir, ctx);
 	}
 
+	if (ctx.hasSheen) {
+		vec3 sheenLightDim = getSheenAlbedoLightDim(params.sheenColor, dot(lightDir, ctx.geomNormal), ctx.sheenGloss);
+		res *= sheenLightDim;
+	}
+
 	return res;
 }
 
@@ -970,9 +1321,42 @@ vec3 computeDirectReflectionContribution(VRayMtlInitParams params, VRayMtlContex
 	return res;
 }
 
+// Sheen BRDF contribution based on the "Production Friendly Microfacet Sheen BRDF" paper
+vec3 computeDirectSheenContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir) {
+	vec3 res = vec3(0.0);
+
+	// Use fixed IOR for sheen
+	float glossyFresnelCoeff = getConductorFresnel(-dot(ctx.e, normalize(lightDir - ctx.e)), SHEEN_N, SHEEN_K);
+	float k = sheenProbability(ctx.e, lightDir, ctx.geomNormal, ctx.sheenGloss);
+	res = vec3(k) * glossyFresnelCoeff * 0.5;
+
+	return res;
+}
+
+vec3 computeDirectCoatContribution(VRayMtlInitParams params, VRayMtlContext ctx, vec3 lightDir) {
+	return vrayMtlGGXCoat(lightDir, ctx);
+}
+
 vec3 computeIndirectDiffuseContribution(VRayMtlInitParams params, VRayMtlContext ctx) {
 	vec3 res = vec3(0.0);
-	res = engEnvIrradiance(params.geomNormal);
+
+	if (ctx.hasSheen) {
+		int numSamples = NUM_ENV_SAMPLES + int(float(NUM_ENV_SAMPLES_ROUGH) * 2.0);
+		float invNumSamples = 1.0 / float(numSamples);
+		vec3 envSum = vec3(0.0);
+		for (int i = 0; i < numSamples; ++i) {
+			float brdfContrib = 0.0;
+			float rayProb = 0.0;
+			vec3 dir = sampleDiffuseBRDF(params, ctx, i, numSamples, rayProb, brdfContrib);
+			vec3 sheenLightDim = getSheenAlbedoLightDim(params.sheenColor, dot(dir, ctx.geomNormal), ctx.sheenGloss);
+			float lod = computeEnvLOD(dir, rayProb, numSamples);
+			envSum += engTextureEnvMapLOD(dir, lod) * brdfContrib * sheenLightDim;
+		}
+		res += envSum * invNumSamples;
+	} else {
+		res = engEnvIrradiance(params.geomNormal);
+	}
+
 	return res;
 }
 
@@ -982,8 +1366,8 @@ vec3 computeIndirectReflectionContribution(VRayMtlInitParams params, VRayMtlCont
 	if (!params.traceReflections)
 		return res;
 
-	int numSamples = NUM_ENV_SAMPLES + int(float(NUM_ENV_SAMPLES_ROUGH) * (params.aniso + 0.5 * (1.0 - ctx.reflGloss)));
-	if (ctx.gloss2 < 0.0001)
+	int numSamples = NUM_ENV_SAMPLES + int(float(NUM_ENV_SAMPLES_ROUGH) * (params.aniso + 0.5 * ctx.roughnessSqr));
+	if (ctx.roughnessSqr < 0.0001)
 		numSamples = 1;
 	float invNumSamples = 1.0 / float(numSamples);
 	vec3 envSum = vec3(0.0);
@@ -1033,6 +1417,53 @@ vec3 computeIndirectRefractionContribution(
 	return res;
 }
 
+vec3 computeIndirectSheenContribution(VRayMtlInitParams params, VRayMtlContext ctx) {
+	vec3 res = vec3(0.0);
+
+	if (!params.traceReflections || !ctx.hasSheen)
+		return res;
+
+	int numSamples = NUM_ENV_SAMPLES + int(float(NUM_ENV_SAMPLES_ROUGH) * 0.5 * (1.0 - ctx.sheenGloss));
+	float invNumSamples = 1.0 / float(numSamples);
+	vec3 envSum = vec3(0.0);
+	for (int i = 0; i < numSamples; ++i) {
+		float brdfContrib = 0.0;
+		float rayProb = 0.0;
+		vec3 dir = sampleSheenBRDF(params, ctx, i, numSamples, rayProb, brdfContrib);
+		if (brdfContrib < 1e-6)
+			continue;
+		float lod = computeEnvLOD(dir, rayProb, numSamples);
+		envSum += engTextureEnvMapLOD(dir, lod) * brdfContrib;
+	}
+	res += envSum * invNumSamples;
+
+	return res;
+}
+
+vec3 computeIndirectCoatContribution(VRayMtlInitParams params, VRayMtlContext ctx) {
+	vec3 res = vec3(0.0);
+
+	if (!params.traceReflections || !ctx.hasCoat)
+		return res;
+
+	int numSamples = NUM_ENV_SAMPLES + int(float(NUM_ENV_SAMPLES_ROUGH) * 0.5 * ctx.coatRoughnessSqr);
+	if (ctx.coatRoughnessSqr < 0.0001)
+		numSamples = 1;
+	float invNumSamples = 1.0 / float(numSamples);
+	vec3 envSum = vec3(0.0);
+	for (int i = 0; i < numSamples; ++i) {
+		float brdfContrib = 0.0;
+		float rayProb = 0.0;
+		vec3 dir = sampleCoatBRDF(params, ctx, i, numSamples, rayProb, brdfContrib);
+		if (brdfContrib < 1e-6)
+			continue;
+		float lod = computeEnvLOD(dir, rayProb, numSamples);
+		envSum += engTextureEnvMapLOD(dir, lod) * brdfContrib;
+	}
+	res += envSum * invNumSamples;
+
+	return res;
+}
 
 //////////////////////////////////////////////////////////////////////
 // End of VRayMtl implementation.
@@ -1060,9 +1491,14 @@ struct VRayMtlPreset {
 	bool useRoughness;
 	vec3 fogColor;
 	float fogMult;
+	vec3 sheenColor;
+	float sheenGlossiness;
+	vec3 coatColor;
+	float coatAmount;
+	float coatGlossiness;
 };
 
-#define PRESET_COUNT 22
+#define PRESET_COUNT 24
 
 const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 // aluminium
@@ -1080,7 +1516,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.002,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // aluminium (rough)
 	VRayMtlPreset(
@@ -1097,7 +1538,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.002,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // aluminium (brushed)
 	VRayMtlPreset(
@@ -1114,7 +1560,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.002,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // chrome
 	VRayMtlPreset(
@@ -1131,7 +1582,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.03,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // copper
 	VRayMtlPreset(
@@ -1148,7 +1604,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.21901,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // copper (rough)
 	VRayMtlPreset(
@@ -1165,7 +1626,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.21901,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // gold
 	VRayMtlPreset(
@@ -1182,7 +1648,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.35002,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // gold (rough)
 	VRayMtlPreset(
@@ -1199,7 +1670,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.35002,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // iron
 	VRayMtlPreset(
@@ -1216,7 +1692,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.006,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // lead
 	VRayMtlPreset(
@@ -1233,7 +1714,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.016,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // silver
 	VRayMtlPreset(
@@ -1250,7 +1736,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.082,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // silver (rough)
 	VRayMtlPreset(
@@ -1267,7 +1758,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.082,
 /* useRoughness    */ true,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // diamond
 	VRayMtlPreset(
@@ -1284,7 +1780,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 2.42,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // glass
 	VRayMtlPreset(
@@ -1301,7 +1802,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.517,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // glass (frosted)
 	VRayMtlPreset(
@@ -1318,7 +1824,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.517,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // glass (tinted)
 	VRayMtlPreset(
@@ -1335,7 +1846,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.517,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(0.702, 0.95, 0.702),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // water
 	VRayMtlPreset(
@@ -1352,7 +1868,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.333,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // chocolate
 	VRayMtlPreset(
@@ -1369,7 +1890,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.59,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // ceramic
 	VRayMtlPreset(
@@ -1386,7 +1912,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.6,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // plastic
 	VRayMtlPreset(
@@ -1403,7 +1934,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.46,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // rubber
 	VRayMtlPreset(
@@ -1420,7 +1956,12 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.468,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
 
 // generic rough white ball
 	VRayMtlPreset(
@@ -1437,7 +1978,56 @@ const VRayMtlPreset gPresets[PRESET_COUNT] = VRayMtlPreset[PRESET_COUNT](
 /* refractionIOR   */ 1.6,
 /* useRoughness    */ false,
 /* fogColor		   */ vec3(1.0, 1.0, 1.0),
-/* fogMult		   */ 1.0)
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0f,
+/* coatGlossiness  */ 1.0),
+
+// basic sheen
+	VRayMtlPreset(
+/* diffuseColor    */ vec3(0.25, 0.25, 0.25),
+/* roughness	   */ 0.0,
+/* reflColor	   */ vec3(0.0, 0.0, 0.0),
+/* reflGloss	   */ 0.0,
+/* metalness	   */ 0.0,
+/* aniso		   */ 0.0,
+/* anisoRotation   */ 0.0,
+/* anisoAxis	   */ 2,
+/* refractionColor */ vec3(0.0, 0.0, 0.0),
+/* refrGloss	   */ 1.0,
+/* refractionIOR   */ 1.6,
+/* useRoughness    */ false,
+/* fogColor		   */ vec3(1.0, 1.0, 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 1.0),
+/* sheenGlossiness */ 0.85,
+/* coatColor	   */ vec3(0.0, 0.0, 0.0),
+/* coatAmount      */ 0.0,
+/* coatGlossiness  */ 1.0),
+
+// basic coat
+	VRayMtlPreset(
+/* diffuseColor    */ vec3(0.0, 1.0, 1.0),
+/* roughness	   */ 0.0,
+/* reflColor	   */ vec3(1.0, 1.0, 1.0),
+/* reflGloss	   */ 0.4,
+/* metalness	   */ 0.0,
+/* aniso		   */ 0.0,
+/* anisoRotation   */ 0.0,
+/* anisoAxis	   */ 2,
+/* refractionColor */ vec3(0.0, 0.0, 0.0),
+/* refrGloss	   */ 1.0,
+/* refractionIOR   */ 1.6,
+/* useRoughness    */ false,
+/* fogColor		   */ vec3(1.0, 1.0, 1.0),
+/* fogMult		   */ 1.0,
+/* sheenColor	   */ vec3(0.0, 0.0, 0.0),
+/* sheenGlossiness */ 1.0,
+/* coatColor	   */ vec3(1.0, 0.0, 1.0),
+/* coatAmount      */ 1.0,
+/* coatGlossiness  */ 0.95)
 
 ); // end presets
 
@@ -1474,6 +2064,11 @@ void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
 		initParams.useRoughness = gPresets[presetIdx].useRoughness;
 		initParams.fogColor = gPresets[presetIdx].fogColor;
 		initParams.fogMult = gPresets[presetIdx].fogMult;
+		initParams.sheenColor = gPresets[presetIdx].sheenColor;
+		initParams.sheenGlossiness = gPresets[presetIdx].sheenGlossiness;
+		initParams.coatColor = gPresets[presetIdx].coatColor;
+		initParams.coatAmount = gPresets[presetIdx].coatAmount;
+		initParams.coatGlossiness = gPresets[presetIdx].coatGlossiness;
 	}
 }
 
@@ -1511,6 +2106,8 @@ vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweep
 	initParams.fogColor = vec3(0.0, 0.0, 0.0);
 	initParams.fogBias = 0.0;
 	initParams.sssOn = false;
+	initParams.sheenAmount = 1.0;
+	initParams.coatIOR = 1.6;
 	// unused yet - corresponds to translucency color in SSS
 	initParams.translucencyColor = vec3(1.0);
 	initParams.sssFwdBackCoeff = 0.0;
@@ -1526,14 +2123,28 @@ vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweep
 	vec3 diffuseDirect = computeDirectDiffuseContribution(initParams, ctx, lightDir);
 	vec3 diffuseIndirect = computeIndirectDiffuseContribution(initParams, ctx);
 	vec3 diffuse = diffuseDirect + diffuseIndirect;
-	vec3 reflection =
-		(computeDirectReflectionContribution(initParams, ctx, lightDir)
-		 + computeIndirectReflectionContribution(initParams, ctx));
+	vec3 reflDirect = computeDirectReflectionContribution(initParams, ctx, lightDir);
+	vec3 reflIndirect = computeIndirectReflectionContribution(initParams, ctx);
+	vec3 reflection = reflDirect + reflIndirect;
+	vec3 sheen = vec3(0.0);
+	if (ctx.hasSheen) {
+		vec3 sheenDirect = computeDirectSheenContribution(initParams, ctx, lightDir);
+		vec3 sheenIndirect = computeIndirectSheenContribution(initParams, ctx);
+		sheen = sheenDirect + sheenIndirect;
+	}
+
+	vec3 coat = vec3(0.0);
+	if (ctx.hasCoat) {
+		vec3 coatDirect = computeDirectCoatContribution(initParams, ctx, lightDir);
+		vec3 coatIndirect = computeIndirectCoatContribution(initParams, ctx);
+		coat = coatDirect + coatIndirect;
+	}
+	
 	float alpha = intensity(ctx.opacity);
 	vec3 refraction = computeRefractFogContrib(initParams, ctx, diffuseDirect)
 		+ computeIndirectRefractionContribution(initParams, ctx, alpha, -initParams.Vw);
 
-	return +ctx.diff * (diffuseDirect + diffuseIndirect) + reflection * ctx.refl + ctx.illum + refraction * ctx.refr;
+	return diffuse * ctx.diff + reflection * ctx.refl + ctx.illum + refraction * ctx.refr + sheen * ctx.sheen + coat * ctx.coat;
 }
 
 
