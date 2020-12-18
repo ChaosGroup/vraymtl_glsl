@@ -28,7 +28,7 @@ The implementation supports the following major features:
 
 ## Unsupported features ##
 
-- Glossy Fresnel (supported only in sheen)
+- Glossy Fresnel (supported only in sheen) because the calculations are a bit heavy for real-time rendering.
 - SSS and fog parameters
 - Normal/Bump Mapping - this is outside of the scope of the current implementation because the normal is usually computed separately before any BRDF calculations
 - Shadows, AO and other global illumination effects - outside of the scope of the current implementation
