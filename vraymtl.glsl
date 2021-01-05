@@ -2073,7 +2073,7 @@ void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
 }
 
 
-vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweepFactor, float fragmentNoise) {
+vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweepFactor, float fragmentNoise, vec2 uv) {
 	// Init VRayMtl with defaults
 	VRayMtlInitParams initParams;
 	initParams.Vw = normalize(eyeDir);
@@ -2150,7 +2150,7 @@ vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweep
 
 // simple raytracing of a sphere
 const float INFINITY = 100000.0;
-float raySphere(vec3 rpos, vec3 rdir, vec3 sp, float radius, inout vec3 point, inout vec3 normal) {
+float raySphere(vec3 rpos, vec3 rdir, vec3 sp, float radius, inout vec3 point, inout vec3 normal, inout vec2 uv) {
 	radius = radius * radius;
 	vec3 tmp = rpos - sp;
 	float dt = dot(rdir, -tmp);
@@ -2163,6 +2163,7 @@ float raySphere(vec3 rpos, vec3 rdir, vec3 sp, float radius, inout vec3 point, i
 	dt = dt - sqrt(radius - tmp.x);
 	point = rpos + rdir * dt;
 	normal = normalize(point - sp);
+	uv = toSpherical(normal);
 	return dt;
 }
 
@@ -2183,13 +2184,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 	const float sphereR = 1.3;
 	vec3 point;
 	vec3 normal;
-	float distToCamera = raySphere(rayOrigin, rayDir, sphereO, sphereR, point, normal);
+	vec2 uv;
+	float distToCamera = raySphere(rayOrigin, rayDir, sphereO, sphereR, point, normal, uv);
 	vec3 linColor;
 	if (distToCamera < INFINITY) {
 		float sweepFactor = 1.0 - abs(dot(normal.xz, camRot[0]));
 		// Ideally this would be blue noise, but regular hash random also works.
 		float fragmentNoise = hashRand(fragCoord + vec2(0.01, 0.023) * float(iTime));
-		linColor = shade(point, normal, rayOrigin - point, distToCamera, sweepFactor, fragmentNoise);
+		linColor = shade(point, normal, rayOrigin - point, distToCamera, sweepFactor, fragmentNoise, uv);
 	} else {
 		linColor = engTextureEnvMapLOD(rayDir, 0.0);
 	}
