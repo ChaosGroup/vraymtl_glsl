@@ -293,11 +293,44 @@ void makeNormalMatrix(in vec3 n, out mat3 m) {
 
 /// Get the Fresnel reflectance for a dielectric.
 /// @param fresnelIOR Surface index of refraction
+/// @param refrIOR Separate index of refraction. Used specifically for internal reflection checks.
 /// @param e View direction
 /// @param n Surface normal
-/// @param refractDir Refracted view direction
-/// @return Fresnel reflectance
-float getFresnelCoeff(float fresnelIOR, vec3 e, vec3 n, vec3 refractDir) {
+/// @param useFresnel True if Fresnel should actually be computed.
+/// @param[out] internalReflection True if the hit produces a total internal reflection.
+/// @return Fresnel reflectance. 1.0 if Fresnel doesn't need to be computed.
+float getFresnelCoeff(float fresnelIOR, float refrIOR, vec3 e, vec3 n, bool useFresnel, out bool internalReflection) {
+	if (!useFresnel)
+		return 1.0;
+	
+	internalReflection = false;
+	vec3 reflectDir    = reflect(e, n);
+
+	// If the Fresnel IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
+	if (fresnelIOR > 1e-6 && fresnelIOR < 1.0 && refrIOR >= 1.0) {
+		fresnelIOR = 1.0 / fresnelIOR;
+	}
+
+	// check for internal reflection
+	vec3  refractDir;
+	bool  outToIn = (dot(n, e) < 0.0);
+	float ior     = (outToIn ? 1.0 / refrIOR : refrIOR);
+	vec3  normal  = (outToIn ? n : -n);
+	fresnelIOR    = (outToIn ? fresnelIOR : ior);
+	
+	float cost    = -dot(e, normal);
+	float sintSqr = 1.0 - ior * ior * (1.0 - cost * cost);
+	if (sintSqr > 1e-6) {
+		internalReflection = false;
+		refractDir         = ior * e + (ior * cost - sqrt(sintSqr)) * normal;
+	} else {
+		internalReflection = true;
+		refractDir         = reflectDir;
+	}
+
+	if (internalReflection)
+		return 1.0;
+
 	if (abs(fresnelIOR - 1.0) < 1e-6)
 		return 0.0;
 
@@ -306,7 +339,7 @@ float getFresnelCoeff(float fresnelIOR, vec3 e, vec3 n, vec3 refractDir) {
 
 	if (cosIn > 1.0 - 1e-12 || cosR > 1.0 - 1e-12) { // View direction is perpendicular to the surface
 		float f = (fresnelIOR - 1.0) / (fresnelIOR + 1.0);
-		return f * f;
+		return clamp(f * f, 0.0, 1.0);
 	}
 
 	float ks = (cosR / cosIn) * fresnelIOR;
@@ -317,7 +350,7 @@ float getFresnelCoeff(float fresnelIOR, vec3 e, vec3 n, vec3 refractDir) {
 	float fp2 = (kp - 1.0) / (kp + 1.0);
 	float Fp = fp2 * fp2;
 
-	return 0.5 * (Fs + Fp);
+	return clamp(0.5 * (Fs + Fp), 0.0, 1.0);
 }
 
 /// Get the Fresnel reflectance for a conductor.
@@ -999,7 +1032,6 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	bool traceRefractions = initParams.traceRefractions;
 	float refractionIOR = initParams.refractionIOR;
 	bool useFresnel = initParams.useFresnel;
-	float fresnelIOR = initParams.fresnelIOR;
 	bool lockFresnelIOR = initParams.lockFresnelIOR;
 	bool doubleSided = initParams.doubleSided;
 	bool useRoughness = initParams.useRoughness;
@@ -1032,28 +1064,10 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	if (doubleSided && dot(geomNormal, result.e) > 0.0)
 		geomNormal = -geomNormal;
 
-	vec3 reflectDir = reflect(result.e, geomNormal);
 	result.geomNormal = geomNormal;
 
-	// check for internal reflection
 	bool internalReflection;
-	vec3 refractDir;
-	bool outToIn = (dot(geomNormal, result.e) < 0.0);
-	float ior = (outToIn ? 1.0 / refractionIOR : refractionIOR);
-	vec3 normal = (outToIn ? geomNormal : -geomNormal);
-
-	float cost = -dot(result.e, normal);
-	float sintSqr = 1.0 - ior * ior * (1.0 - cost * cost);
-	if (sintSqr > 1e-6) {
-		internalReflection = false;
-		refractDir = ior * result.e + (ior * cost - sqrt(sintSqr)) * normal;
-	} else {
-		internalReflection = true;
-		refractDir = reflectDir;
-	}
-	float fresnel = 1.0;
-	if (useFresnel && !internalReflection)
-		fresnel = clamp(getFresnelCoeff(fresnelIOR, result.e, normal, refractDir), 0.0, 1.0);
+	float fresnel = getFresnelCoeff(initParams.fresnelIOR, refractionIOR, result.e, geomNormal, useFresnel, internalReflection);
 
 	vec3 reflNoFresnel = reflColor * reflAmount * result.opacity;
 	result.refl = reflNoFresnel * fresnel;
@@ -1082,8 +1096,8 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	}
 
 	result.hasCoat = (initParams.coatAmount > 1e-6);
-	if (result.hasCoat && !internalReflection) {
-		float coatFresnel = clamp(getFresnelCoeff(initParams.coatIOR, result.e, normal, refractDir), 0.0, 1.0);
+	if (result.hasCoat) {
+		float coatFresnel = getFresnelCoeff(initParams.coatIOR, refractionIOR, result.e, geomNormal, true, internalReflection);
 		float coatAmount = initParams.coatAmount;
 		vec3 coatColor = initParams.coatColor * (1.0 - coatFresnel);
 		vec3 coatDim = traceReflections ? ((1.0 - coatAmount) + coatAmount * coatColor) : vec3(1.0);
