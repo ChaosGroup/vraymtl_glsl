@@ -213,7 +213,6 @@ struct VRayMtlContext {
 	bool hasSheen;
 	float sheenGloss;
 	vec3 coat;
-	mat3 coatNM;
 	float coatRoughnessSqr;
 	bool hasCoat;
 };
@@ -695,7 +694,7 @@ vec3 getGGXDir(
 
 vec3 sampleBRDF(
 	VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
-	vec3 geomNormal = params.geomNormal;
+	vec3 geomNormal = ctx.geomNormal;
 	float ggxTail = params.gtrGamma;
 	int brdfType = params.brdfType;
 	vec2 uv = rand(ctx, sampleIdx, nbSamples);
@@ -722,14 +721,14 @@ vec3 sampleBRDF(
 
 vec3 sampleCoatBRDF(
 	VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
-	vec3 geomNormal = params.geomNormal;
+	vec3 geomNormal = ctx.geomNormal;
 	vec2 uv = rand(ctx, sampleIdx, nbSamples);
 	float u = uv.x, v = uv.y;
 
 	vec3 dir = vec3(0.0);
 	rayProb = 1.0;
 	brdfContrib = 1.0;
-	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, rayProb, brdfContrib);
+	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.nm, rayProb, brdfContrib);
 
 	if (dot(dir, geomNormal) < 0.0) {
 		brdfContrib = 0.0;
@@ -739,7 +738,7 @@ vec3 sampleCoatBRDF(
 
 vec3 sampleRefractBRDF(
 	VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out bool totalInternalReflection) {
-	vec3 geomNormal = params.geomNormal;
+	vec3 geomNormal = ctx.geomNormal;
 	vec3 refractDir = refract(ctx.e, geomNormal, 1.0 / params.refractionIOR);
 	totalInternalReflection = false;
 	if (refractDir == vec3(0.0)) {
@@ -1093,7 +1092,6 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 		result.refr *= coatDim;
 		result.sheen *= coatDim;
 		result.diff *= coatDim;
-		makeNormalMatrix(geomNormal, result.coatNM);
 		result.coat = vec3(1.0) * initParams.coatAmount * coatFresnel;
 	}
 
@@ -1262,7 +1260,6 @@ vec3 vrayMtlGGXCoat(vec3 lightDir, VRayMtlContext ctx) {
 		if (hn.z > 1e-3) {
 			float D = getGGXMicrofacetDistribution(hn.z, ctx.coatRoughnessSqr, 2.0);
 			float G = getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.coatRoughnessSqr, 2.0);
-			vec3 micron = ctx.coatNM * hn;
 			float k = 0.25 * D * G * PI / cs1;
 			if (k > 0.0)
 				return vec3(k);
