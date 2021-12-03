@@ -215,6 +215,8 @@ struct VRayMtlContext {
 	vec3 coat;
 	float coatRoughnessSqr;
 	bool hasCoat;
+	mat3 coatNM;
+	mat3 coatINM;
 };
 
 vec3 sampleBRDF(VRayMtlInitParams params, VRayMtlContext ctx,
@@ -300,10 +302,10 @@ void makeNormalMatrix(in vec3 n, out mat3 m) {
 /// @param[out] internalReflection True if the hit produces a total internal reflection.
 /// @return Fresnel reflectance. 1.0 if Fresnel doesn't need to be computed.
 float getFresnelCoeff(float fresnelIOR, float refrIOR, vec3 e, vec3 n, bool useFresnel, out bool internalReflection) {
+	internalReflection = false;
 	if (!useFresnel)
 		return 1.0;
-	
-	internalReflection = false;
+
 	vec3 reflectDir    = reflect(e, n);
 
 	// If the Fresnel IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
@@ -761,7 +763,7 @@ vec3 sampleCoatBRDF(
 	vec3 dir = vec3(0.0);
 	rayProb = 1.0;
 	brdfContrib = 1.0;
-	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.nm, rayProb, brdfContrib);
+	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, rayProb, brdfContrib);
 
 	if (dot(dir, geomNormal) < 0.0) {
 		brdfContrib = 0.0;
@@ -1107,6 +1109,8 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 		result.sheen *= coatDim;
 		result.diff *= coatDim;
 		result.coat = vec3(1.0) * initParams.coatAmount * coatFresnel;
+		makeNormalMatrix(geomNormal, result.coatNM);
+		result.coatINM = transpose(result.coatNM); // inverse = transpose for orthogonal matrix
 	}
 
 	result.gloss1 = max(0.0, 1.0 / pow35(max(1.0 - reflGloss, 1e-4)) - 1.0); // [0, 1] -> [0, inf)
@@ -1124,10 +1128,10 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	else if (anisoAxis == 1)
 		anisoDirection = vec3(0.0, 1.0, 0.0);
 	float anisoAbs = abs(aniso);
-	if (anisoAbs < 1e-12 || anisoAbs >= 1.0 - 1e-6) {
+	if (anisoAbs < 1e-12 || anisoAbs >= 1.0 - 1e-6 || internalReflection) {
 		makeNormalMatrix(geomNormal, result.nm);
 		result.inm = transpose(result.nm); // inverse = transpose for orthogonal matrix
-	} else if (!internalReflection) {
+	} else {
 		vec3 base0, base1;
 		base0 = normalize(cross(geomNormal, anisoDirection));
 		base1 = normalize(cross(base0, geomNormal));
@@ -1270,7 +1274,7 @@ vec3 vrayMtlGGXCoat(vec3 lightDir, VRayMtlContext ctx) {
 	float lightNdotL = dot(ctx.geomNormal, lightDir);
 	if (lightNdotL > 1e-6 && cs1 > 1e-6) {
 		vec3 hw = normalize(lightDir - ctx.e);
-		vec3 hn = normalize(ctx.inm * hw);
+		vec3 hn = normalize(ctx.coatINM * hw);
 		if (hn.z > 1e-3) {
 			float D = getGGXMicrofacetDistribution(hn.z, ctx.coatRoughnessSqr, 2.0);
 			float G = getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.coatRoughnessSqr, 2.0);
