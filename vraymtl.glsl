@@ -1334,15 +1334,60 @@ float pow35(float x) {
 	return x * x * x * sqrt(x);
 }
 
-/// Blend between a metal color and reflection color based on a dielectric Fresnel value
-/// This approximates the tinted reflection visible in some conductors
-/// @param metalColor Metallic color, currently derived from the diffuse (base) color and the metalness value.
-/// @param reflectionColor The color of the specular highlight
-/// @param fresnel Dielectric fresnel coefficient
+/// Artist-Friendly Metallic Fresnel by Ole Gulbrandsen. Works by trying to estimate the n and k values with some plausible
+/// formula and then using those n and k values to compute the Fresnel effect. See
+/// http://jcgt.org/published/0003/04/03/paper.pdf for more information.
+/// Compute the complex index of refraction n+ik based on the reflectivity r and the edgetint g.
+/// @param[in] r Reflectivity
+/// @param[in] g Edgetint
+/// @param[out] n Refractive index
+/// @param[out] k2 Extinction coefficient squared
+void getOleNK2(vec3 r, vec3 g, out vec3 n, out vec3 k2) {
+	vec3 rClamped = min(r, vec3(0.9999f));
+	vec3 rSqrt = sqrt(rClamped);
+	vec3 nMin = (1.0 - rClamped) / (1.0 + rClamped);
+	vec3 nMax = (1.0 + rSqrt) / (1.0 - rSqrt);
+	n = mix(nMax, nMin, g);
+	k2 = ((n + 1.0) * (n + 1.0f) * rClamped - (n - 1.0) * (n - 1.0)) / (1.0 - rClamped);
+}
+
+/// Use an accurate Fresnel formula for conductors to compute reflections from metals (metalness > 0).
+/// @param diffuseColor The color of the diffuse layer.
+/// @param reflectionColor The color of the reflection layer.
+/// @param metalness Controls the reflection from dielectric - 0, to metallic - 1.
+/// @param viewDir Normalized direction towards the camera.
+/// @param outDir Normalized direction towards the light source.
+/// @param dielectricFresnel Dielectric Fresnel used for blending with the conductor Fresnel.
+/// @param thinFilmThickness Thin film thickness in nanometers.
+/// @param thinFilmIOR IOR of the thin film layer.
 /// @return Blended reflection color.
-vec3 computeMetallicReflection(vec3 metalColor, vec3 reflectionColor, vec3 fresnel) {
-	vec3 reflectionDim = reflectionColor * fresnel;
-	return metalColor * (1.0 - reflectionDim) + reflectionDim;
+vec3 computeMetallicReflection(
+	vec3 diffuseColor,
+	vec3 reflectionColor,
+	float metalness,
+	vec3 viewDir,
+	vec3 outDir,
+	vec3 dielectricFresnel,
+	float thinFilmThickness,
+	float thinFilmIOR
+) {
+	vec3 conductorIOR;
+	vec3 conductorExtinction2;
+	// Compute the complex index of refraction using Ole Gulbrandsen's remapping of reflectivity and edgetint colors.
+	getOleNK2(diffuseColor, reflectionColor, conductorIOR, conductorExtinction2);
+
+	vec3 h = normalize(outDir + viewDir);
+	float cosIn = dot(viewDir, h);
+	vec3 dielectricColor = dielectricFresnel * reflectionColor;
+	vec3 conductorColor = getFresnelConductorWithThinFilm(
+		conductorIOR,
+		conductorExtinction2,
+		cosIn,
+		thinFilmThickness,
+		thinFilmIOR
+	);
+
+	return mix(dielectricColor, conductorColor, metalness);
 }
 
 VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
@@ -1438,9 +1483,6 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	vec3 reflNoFresnel = reflColor * reflAmount * result.opacity;
 	result.refl = reflNoFresnel * fresnel;
 
-	// Reflection calculation including metalness. Taken from VRayMtl's original implementation.
-	vec3 metalColor = result.diff * metalness;
-
 	vec3 dielectricReflectionTransparency = traceReflections ? (1.0 - result.refl) : vec3(1.0);
 	vec3 reflectionTransparency = (1.0 - metalness) * dielectricReflectionTransparency;
 	if (traceRefractions) {
@@ -1448,9 +1490,22 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	} else {
 		result.refr = vec3(0.0);
 	}
-	result.diff *= reflectionTransparency - result.refr;
 
-	result.refl = computeMetallicReflection(metalColor, reflNoFresnel, fresnel);
+	if (metalness > 1e-6f) {
+		vec3 outDir = reflect(result.e, geomNormal);
+		result.refl = computeMetallicReflection(
+			result.diff,
+			reflNoFresnel,
+			metalness,
+			-result.e,
+			outDir,
+			fresnel,
+			thinFilmThickness,
+			thinFilmIOR
+		);
+	}
+
+	result.diff *= reflectionTransparency - result.refr;
 
 	vec3 sheenColor = initParams.sheenColor * initParams.sheenAmount;
 	result.hasSheen = ((sheenColor.x + sheenColor.y + sheenColor.z) > 1e-6) && (1.0 - sheenGloss > 1e-5);
@@ -2445,7 +2500,6 @@ int getPresetIdx(float sweepFactor) {
 	return presetIdx;
 }
 
-
 void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
 	int presetIdx = getPresetIdx(sweepFactor);
 	if (presetIdx >= 0 && presetIdx < PRESET_COUNT) {
@@ -2470,7 +2524,6 @@ void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
 		initParams.coatGlossiness = gPresets[presetIdx].coatGlossiness;
 	}
 }
-
 
 vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweepFactor, float fragmentNoise, vec2 uv) {
 	// Init VRayMtl with defaults
