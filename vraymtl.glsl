@@ -27,6 +27,8 @@ precision highp float;
 #define PI 3.1415926535897932384626433832795
 #define INV_PI 0.31830988618
 #define INV_2PI 0.15915494309
+#define LARGE_FLOAT (1e18f)
+
 // A spherical env map affects how the LOD is computed based on normal
 #define ENV_MAP_SPHERICAL 0
 // How many env samples to take - increase for rougher surfaces
@@ -189,6 +191,8 @@ struct VRayMtlInitParams {
 	float coatAmount;
 	float coatGlossiness;
 	float coatIOR;
+	float thinFilmThickness;
+	float thinFilmIOR;
 };
 
 struct VRayMtlContext {
@@ -293,25 +297,38 @@ void makeNormalMatrix(in vec3 n, out mat3 m) {
 	m[2] = n;
 }
 
-/// Get the Fresnel reflectance for a dielectric.
-/// @param fresnelIOR Surface index of refraction
-/// @param refrIOR Separate index of refraction. Used specifically for internal reflection checks.
+/// Compute dielectric Frensel coefficient.
+/// @param cosIn The cosine between the normal and the viewing direction.
+/// @param ior The index of refraction.
+/// @return The Fresnel coefficient.
+float getFresnelCoeff(float cosIn, float ior) {
+	if (abs(ior - 1.0) < 1e-6)
+		return 0.0;
+
+	cosIn = min(cosIn, 1.0f);
+
+	float eta = 1.0f / ior;
+	float sinR = eta * sqrt(1.0f - cosIn * cosIn);
+	if (sinR >= 1.0f)
+		return 1.0f;
+
+	float cosR = sqrt(1.0f - sinR * sinR);
+	float pl = (cosIn - (eta * cosR)) / (cosIn + (eta * cosR));
+	float pp = ((eta * cosIn) - cosR) / ((eta * cosIn) + cosR);
+
+	float fresnel = (pl * pl + pp * pp) * 0.5f;
+	return clamp(fresnel, 0.0f, 1.0f);
+}
+
+/// Compute a refraction direction for a given view direction
+/// @param fresnelIOR IOR used for Fresnel calculations
+/// @param refrIOR IOR used for refraction
 /// @param e View direction
 /// @param n Surface normal
-/// @param useFresnel True if Fresnel should actually be computed.
-/// @param[out] internalReflection True if the hit produces a total internal reflection.
-/// @return Fresnel reflectance. 1.0 if Fresnel doesn't need to be computed.
-float getFresnelCoeff(float fresnelIOR, float refrIOR, vec3 e, vec3 n, bool useFresnel, out bool internalReflection) {
-	internalReflection = false;
-	if (!useFresnel)
-		return 1.0;
-
-	vec3 reflectDir    = reflect(e, n);
-
-	// If the Fresnel IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
-	if (fresnelIOR > 1e-6 && fresnelIOR < 1.0 && refrIOR >= 1.0) {
-		fresnelIOR = 1.0 / fresnelIOR;
-	}
+/// @param[out] internalReflection True if this is a total internal reflection
+/// @return The refraction direction
+vec3 computeRefractDir(float fresnelIOR, float refrIOR, vec3 e, vec3 n, out bool internalReflection) {
+	vec3 reflectDir = reflect(e, n);
 
 	// check for internal reflection
 	vec3  refractDir;
@@ -329,30 +346,7 @@ float getFresnelCoeff(float fresnelIOR, float refrIOR, vec3 e, vec3 n, bool useF
 		internalReflection = true;
 		refractDir         = reflectDir;
 	}
-
-	if (internalReflection)
-		return 1.0;
-
-	if (abs(fresnelIOR - 1.0) < 1e-6)
-		return 0.0;
-
-	float cosIn = -dot(e, n);
-	float cosR = -dot(refractDir, n);
-
-	if (cosIn > 1.0 - 1e-12 || cosR > 1.0 - 1e-12) { // View direction is perpendicular to the surface
-		float f = (fresnelIOR - 1.0) / (fresnelIOR + 1.0);
-		return clamp(f * f, 0.0, 1.0);
-	}
-
-	float ks = (cosR / cosIn) * fresnelIOR;
-	float fs2 = (ks - 1.0) / (ks + 1.0);
-	float Fs = fs2 * fs2;
-
-	float kp = (cosIn / cosR) * fresnelIOR;
-	float fp2 = (kp - 1.0) / (kp + 1.0);
-	float Fp = fp2 * fp2;
-
-	return clamp(0.5 * (Fs + Fp), 0.0, 1.0);
+	return refractDir;
 }
 
 /// Get the Fresnel reflectance for a conductor.
@@ -372,6 +366,344 @@ float getConductorFresnel(float cosTheta, float n, float k) {
 	float rs = (rsa - nc2) / (rsa + nc2);
 	float rp = (rpa - nc2) / (rpa + nc2);
 	return 0.5f * (rs + rp);
+}
+
+/// Get the Fresnel reflectance for a conductor.
+/// Accurate values for n and k can be obtained from https://refractiveindex.info/
+/// Some presets can be found below.
+/// For some conductors the n and k parameters vary with the light wavelength so the
+/// Fresnel reflectance should be computed separately for R,G and B.
+/// @param n Refractive index
+/// @param k2 Extinction coefficient squared
+/// @param cosIn Cosine of the angle between the view direction and the normal
+/// @return Fresnel reflectance.
+/// @note This formula is accurate for the metals but not for dielectrics when k is close to 0. 
+/// For a general formula that is accurate both for conductors and dielectrics see 
+/// https://seblagarde.wordpress.com/2013/04/29/memo-on-fresnel-equations/
+vec3 getConductorFresnelK2(float cosIn, vec3 n, vec3 k2) {
+	vec3 cosIn2 = vec3(cosIn * cosIn);
+	vec3 twoKCos = 2.0f * n * cosIn;
+	vec3 one = vec3(1.0f);
+
+	vec3 t0 = n * n + k2;
+	vec3 t1 = t0 * cosIn2;
+	vec3 rs = (t0 - twoKCos + cosIn2) / (t0 + twoKCos + cosIn2);
+	vec3 rp = (t1 - twoKCos + one) / (t1 + twoKCos + one);
+
+	return 0.5f * (rp + rs);
+}
+
+/// Thin film reflectance functions based on the paper:
+/// A Practical Extension to Microfacet Theory for the Modeling of Varying Iridescence
+/// https://belcour.github.io/blog/research/publication/2017/05/01/brdf-thin-film.html
+/// The main function is getFresnelAiry() and it's used as a replacement of the Fresnel term in BRDF calculations.
+/// The thin film layer is parametrized with thickness (nanometers) and thin film IOR.
+/// The thin film interference effect vanishes for thickness values close to 0 nm and larger than several thousand nm (e.g. 6000).
+
+/// Fresnel for dielectric/dielectric interface and polarized light.
+void getPolarizedDielectricFresnel(
+	float cosTheta, ///< [in] Cosine of the angle between the view dir and the half vector
+	float n1, ///< [in] IOR of the first dielectric layer
+	float n2, ///< [in] IOR of the seond dielectric layer
+	out vec2 F, ///< [out] The amplitude of the complex polarized Fresnel reflectance (s-polarized in the X component, p-polarized in the Y component).
+	out vec2 phi ///< [out] The phase shift of the complex polarized Fresnel reflectance (s-polarized in the X component, p-polarized in the Y component).
+) {
+	// n2 zero check is done outside of this function.
+	float eta2 = sqr(n1 / n2);
+	float st2 = 1.0f - cosTheta * cosTheta;
+
+	// Check for total internal reflection
+	if (eta2 * st2 >= 1.0f) {
+		F = vec2(1.0f, 1.0f);
+		// eta2 can't be 0, we check n1 and n2 in getFresnelAiry()
+		float s = (abs(cosTheta) > 1e-6f) ? (sqrt(st2 - 1.0f / eta2) / cosTheta) : LARGE_FLOAT;
+		phi.x = 2.0f * atan(-eta2 * s);
+		phi.y = 2.0f * atan(-s);
+		return;
+	}
+
+	float cosTheta_t = sqrt(1.0f - eta2 * st2);
+	// rDenom can't be 0 because both n1 and n2 are non-zero (checked in getFresnelAiry())
+	// and at least one of cosTheta and cosTheta_t has to be non-zero.
+	vec2 rDenom = vec2(
+		n2 * cosTheta + n1 * cosTheta_t,
+		n1 * cosTheta + n2 * cosTheta_t
+	);
+	vec2 r = vec2(
+		(n2 * cosTheta - n1 * cosTheta_t) / rDenom.x,
+		(n1 * cosTheta - n2 * cosTheta_t) / rDenom.y
+	);
+	F = vec2(sqr(r.x), sqr(r.y));
+	phi.x = (r.x < 0.0f) ? PI : 0.0f;
+	phi.y = (r.y < 0.0f) ? PI : 0.0f;
+}
+
+/// Fresnel for dielectric/conductor interface and polarized light.
+void getPolarizedConductorFresnel(
+	float cosTheta, ///< [in] Cosine of the angle between the view dir and the half vector
+	float n1, ///< [in] IOR of the dielectric layer.
+	float n2, ///< [in] IOR of the conductor layer.
+	float kSqr, ///< [in] Extinction coefficient of the conductor layer. TODO: Add support for wavelength dependent extinction (vec3).
+	out vec2 F, ///< [out] The amplitude of the complex polarized Fresnel reflectance (s-polarized in the X component, p-polarized in the Y component).
+	out vec2 phi ///< [out] The phase shift of the complex polarized Fresnel reflectance (s-polarized in the X component, p-polarized in the Y component).
+) {
+	if (kSqr < 1e-12f) {
+		// Use dielectric formula to avoid numerical issues
+		getPolarizedDielectricFresnel(cosTheta, n1, n2, F, phi);
+		return;
+	}
+
+	float k = sqrt(kSqr);
+	float n1Sqr = sqr(n1);
+	float n2Sqr = sqr(n2);
+
+	float A = n2Sqr * (1.0f - kSqr) - n1Sqr * (1.0f - sqr(cosTheta));
+	float B = sqrt(sqr(A) + sqr(2.0f * n2Sqr * kSqr));
+	float U = sqrt((A + B) * 0.5f);
+	float V = sqrt((B - A) * 0.5f);
+
+	float uSqr = sqr(U);
+	float vSqr = sqr(V);
+	float C = n1 * cosTheta;
+	float fyDenom = sqr(C + U) + vSqr;
+	F.y = (sqr(C - U) + vSqr) / fyDenom;
+	phi.y = atan(
+		2.0f * V * C,
+		uSqr + vSqr - sqr(C)
+	) + PI;
+
+	float D = n2Sqr * cosTheta;
+	float E = D * (1.0f - kSqr);
+	float G = n1 * U;
+	float H = 2.0f * n2Sqr * k * cosTheta;
+	float I = n1 * V;
+
+	float fxDenom = sqr(E + G) + sqr(H + I);
+	F.x = (sqr(E - G) + sqr(H - I)) / fxDenom;
+	phi.x = atan(
+		2.0f * n1 * I * (2.0f * k * U - (1.0f - kSqr) * V),
+		sqr(I * (1.0f + kSqr)) - n1Sqr * (uSqr + vSqr)
+	);
+}
+
+/// Fresnel for dielectric/conductor interface and polarized light.
+void getPolarizedConductorFresnel_f3(
+	float cosTheta, ///< [in] Cosine of the angle between the view dir and the half vector
+	float n1, ///< [in] IOR of the dielectric layer.
+	vec3 n2, ///< [in] IOR of the conductor layer.
+	vec3 kSqr, ///< [in] Extinction coefficient of the conductor layer.
+	out vec3 Fs, ///< [out] The amplitude of the complex polarized Fresnel reflectance (s-polarized).
+	out vec3 Fp, ///< [out] The amplitude of the complex polarized Fresnel reflectance (p-polarized).
+	out vec3 phis, ///< [out] The phase shift of the complex polarized Fresnel reflectance (s-polarized).
+	out vec3 phip ///< [out] The phase shift of the complex polarized Fresnel reflectance (p-polarized).
+) {
+	vec2 Fx, Fy, Fz, phix, phiy, phiz;
+	getPolarizedConductorFresnel(cosTheta, n1, n2.x, kSqr.x, Fx, phix);
+	getPolarizedConductorFresnel(cosTheta, n1, n2.y, kSqr.y, Fy, phiy);
+	getPolarizedConductorFresnel(cosTheta, n1, n2.z, kSqr.z, Fz, phiz);
+	Fs = vec3(Fx.x, Fy.x, Fz.x);
+	Fp = vec3(Fx.y, Fy.y, Fz.y);
+	phis = vec3(phix.x, phiy.x, phiz.x);
+	phip = vec3(phix.y, phiy.y, phiz.y);
+}
+
+/// Evaluate XYZ sensitivity curves in Fourier space
+vec3 evalXYZSensitivityFourier(
+	float opd, ///< [in] Optical path difference
+	vec3 shift ///< [in] Phase shift
+) {
+	// Use Gaussian fits, given by 3 parameters: val, pos and var
+	float phase = 2.0f * PI * opd;
+	const vec3 val = vec3(5.4856e-13f, 4.4201e-13f, 5.2481e-13f);
+	const vec3 pos = vec3(1.6810e+06f, 1.7953e+06f, 2.2084e+06f);
+	const vec3 var = vec3(4.3278e+09f, 9.3046e+09f, 6.6121e+09f);
+	vec3 sqrtTerm = vec3(
+		sqrt(2.0f * PI * var.x),
+		sqrt(2.0f * PI * var.y),
+		sqrt(2.0f * PI * var.z)
+	);
+	vec3 cosTerm = vec3(
+		cos(pos.x * phase + shift.x),
+		cos(pos.y * phase + shift.y),
+		cos(pos.z * phase + shift.z)
+	);
+	vec3 expTerm = vec3(
+		exp(-var.x * phase * phase),
+		exp(-var.y * phase * phase),
+		exp(-var.z * phase * phase)
+	);
+	vec3 xyz = val * sqrtTerm * cosTerm * expTerm;
+	xyz.x += 9.7470e-14f * sqrt(2.0f * PI * 4.5282e+09f) * cos(2.2399e+06f * phase + shift.x) * exp(-4.5282e+09f * phase * phase);
+	return xyz / 1.0685e-7f;
+}
+
+/// Equation 10 in the paper.
+/// All inputs should be either s-polarized or p-polarized.
+vec3 getFourierSpectralIntegral(
+	vec3 S0,
+	float R12,
+	vec3 Rs,
+	float T121,
+	vec3 r123,
+	float D,
+	vec3 phi2
+) {
+	// Reflectance term for m=0 (DC term amplitude)
+	vec3 C0 = vec3(R12, R12, R12) + Rs;
+	vec3 R = C0 * S0;
+
+	// Reflectance term for m>0 (pairs of diracs)
+	vec3 Cm = Rs - vec3(T121, T121, T121);
+	for (int m = 1; m <= 2; ++m) {
+		Cm = Cm * r123;
+		vec3 Sm = 2.0f * evalXYZSensitivityFourier(float(m) * D, float(m) * phi2);
+		R += Cm * Sm;
+	}
+
+	return R;
+}
+
+/// Airy reflectance that replaces the Fresnel term when thin film is used.
+/// Based on the paper:
+/// A Practical Extension to Microfacet Theory for the Modeling of Varying Iridescence
+/// https://belcour.github.io/blog/research/publication/2017/05/01/brdf-thin-film.html
+/// @return Airy reflectance.
+vec3 getFresnelAiry(
+	float cosTheta, ///< [in] Cosine of the angle between the view dir and the half vector
+	vec3 ior, ///< [in] IOR of the layer below the thin film
+	vec3 extinctionSqr, ///< Squared extinction coefficient of the layer below the thin film
+	float thinFilmThickness, ///< [in] Thin film thickness in nanometers
+	float thinFilmIOR ///< [in] IOR of the thin film layer
+) {
+	if (cosTheta < 1e-6f) {
+		return vec3(0.0f);
+	}
+
+	if (ior.x <= 1e-6f || thinFilmIOR <= 1e-6f) {
+		return vec3(1.0f);
+	}
+
+	// Assume vacuum on the outside
+	float eta1 = 1.0f;
+	float eta2 = thinFilmIOR;
+
+	// Check for total internal reflection
+	float sinThetaRefrSqr = sqr(eta1 / eta2) * (1.0f - sqr(cosTheta));
+	if (sinThetaRefrSqr >= 1.0f) {
+		return vec3(1.0f);
+	}
+
+	// Convert nm -> m
+	float d = thinFilmThickness * 1e-9f;
+
+	// Optical path difference
+	float cosTheta2 = sqrt(1.0f - sinThetaRefrSqr);
+	float D = 2.0f * eta2 * d * cosTheta2;
+
+	// First interface
+	vec2 R12, phi12;
+	getPolarizedDielectricFresnel(cosTheta, eta1, eta2, R12, phi12);
+	vec2 T121 = vec2(1.0f, 1.0f) - R12;
+	vec2 phi21 = vec2(PI, PI) - phi12;
+
+	// Second interface
+	vec3 R23s, R23p, phi23s, phi23p;
+	getPolarizedConductorFresnel_f3(cosTheta2, eta2, ior, extinctionSqr, R23s, R23p, phi23s, phi23p);
+
+	// Phase shift
+	vec3 phi2s = vec3(phi21.x, phi21.x, phi21.x) + phi23s;
+	vec3 phi2p = vec3(phi21.y, phi21.y, phi21.y) + phi23p;
+
+	// Compound terms
+	vec3 R = vec3(0.0f, 0.0f, 0.0f);
+	vec3 R123s = R12.x * R23s;
+	vec3 R123p = R12.y * R23p;
+	vec3 r123s = sqrt(R123s);
+	vec3 r123p = sqrt(R123p);
+	vec3 rsDenoms = vec3(1.0f) - R123s;
+	vec3 rsDenomp = vec3(1.0f) - R123p;
+
+	// Use asserts to check the denominator because the only cases
+	// when it's close to 0 so far have been due to incorrect negative cosTheta.
+	vec3 Rss = sqr(T121.x) * R23s / rsDenoms;
+	vec3 Rsp = sqr(T121.y) * R23p / rsDenomp;
+
+	// Note: This is the AA solution described in 4. Analytic Spectral Integration
+	vec3 S0 = vec3(1.0f); // evalXYZSensitivityFourier(0.0f, vec3(0.0f));
+
+	// Reflectance term using spectral antialiasing for Perpendicular polarization
+	R += getFourierSpectralIntegral(S0, R12.x, Rss, T121.x, r123s, D, phi2s);
+
+	// Reflectance term using spectral antialiasing for Parallel polarization
+	R += getFourierSpectralIntegral(S0, R12.y, Rsp, T121.y, r123p, D, phi2p);
+
+	// R contains the sum of the 2 polarized reflectances.
+	// In order to get the depolarized reflectance we just need to divide by 2 (this saves a few divisions).
+	// This is done after the conversion to the renderer color space in the paper's supplemental code which is incorrect.
+	R = R * 0.5f;
+
+	// Convert back to RGB reflectance.
+	// Note: This conversion has to be modified if the renderer's color space is different (e.g. sRGB or ACEScg).
+	const mat3 xyzToRgb = mat3(
+		2.370673f, -0.513883f, 0.005298f,
+		-0.900039f, 1.425302f, -0.014695f,
+		-0.470634f, 0.088581f, 1.009397f
+	);
+	R = clamp(xyzToRgb * R, vec3(0.0f), vec3(1.0f));
+
+	return R;
+}
+
+/// Compute dielectric Frensel coefficient.
+/// @param viewDir The viewing direction (towards the surface).
+/// @param normal The normal pointing towards the outside of the surface.
+/// @param ior The index of refraction.
+/// @return The Fresnel coefficient for reflections.
+vec3 getFresnelCoeffWithThinFilm(
+	float cosIn,
+	float ior,
+	float thinFilmThickness,
+	float thinFilmIOR
+) {
+	if (thinFilmThickness == 0.0f) {
+		float fresnel = getFresnelCoeff(cosIn, ior);
+		return vec3(fresnel);
+	} else {
+		return getFresnelAiry(
+			cosIn,
+			vec3(ior),
+			vec3(0.0f) /* extinctionSqr */,
+			thinFilmThickness,
+			thinFilmIOR
+		);
+	}
+}
+
+/// Get the Fresnel reflectance for a conductor.
+/// Accurate values for n and k can be obtained from https://refractiveindex.info/
+/// Some presets can be found below.
+/// For some conductors the n and k parameters vary with the light wavelength so the
+/// Fresnel reflectance should be computed separately for R,G and B.
+/// @param n Refractive index
+/// @param k2 Extinction coefficient squared
+/// @param cosIn Cosine of the angle between the view direction and the normal
+/// @return Fresnel reflectance.
+/// @note This formula is accurate for the metals but not for dielectrics when k is close to 0. 
+/// For a general formula that is accurate both for conductors and dielectrics see 
+/// https://seblagarde.wordpress.com/2013/04/29/memo-on-fresnel-equations/
+vec3 getFresnelConductorWithThinFilm(
+	vec3 n,
+	vec3 k2,
+	float cosIn,
+	float thinFilmThickness,
+	float thinFilmIOR
+) {
+	if (thinFilmThickness == 0.0f) {
+		vec3 fresnel = getConductorFresnelK2(cosIn, n, k2);
+		return vec3(fresnel);
+	} else {
+		return getFresnelAiry(cosIn, n, k2, thinFilmThickness, thinFilmIOR);
+	}
 }
 
 vec3 getSpecularDir(float u, float v, float k) {
@@ -472,7 +804,7 @@ vec3 getGGXMicroNormal(float uc, float vc, float sharpness, float gtrGamma) {
 }
 
 float getGTR1MicrofacetDistribution(float mz, float sharpness) {
-	float cosThetaM = mz; // dotf(microNormal, normal);
+	float cosThetaM = mz; // dot(microNormal, normal);
 	if (cosThetaM <= 1e-3)
 		return 0.0;
 
@@ -489,7 +821,7 @@ float getGTR1MicrofacetDistribution(float mz, float sharpness) {
 }
 
 float getGTR2MicrofacetDistribution(float mz, float sharpness) {
-	float cosThetaM = mz; // dotf(microNormal, normal);
+	float cosThetaM = mz; // dot(microNormal, normal);
 	if (cosThetaM <= 1e-3)
 		return 0.0;
 
@@ -506,7 +838,7 @@ float getGTR2MicrofacetDistribution(float mz, float sharpness) {
 }
 
 float getGTRMicrofacetDistribution(float mz, float sharpness, float gtrGamma) {
-	float cosThetaM = mz; // dotf(microNormal, normal);
+	float cosThetaM = mz; // dot(microNormal, normal);
 	if (cosThetaM <= 1e-3)
 		return 0.0;
 
@@ -516,7 +848,7 @@ float getGTRMicrofacetDistribution(float mz, float sharpness, float gtrGamma) {
 	float divisor =
 		PI * (1.0 - pow(sharpness2, 1.0 - gtrGamma)) * pow(cosThetaM2 * (sharpness2 + tanThetaM2), gtrGamma);
 	float dividend = (gtrGamma - 1.0) * (sharpness2 - 1.0);
-	// when fabsf(divisor)>fabsf(dividend)*1e-6 no division by zero will occur
+	// when abs(divisor)>abs(dividend)*1e-6 no division by zero will occur
 	// (the dividend and the divisor are always either both positive or both negative);
 	// divisor canget0 in rare situation when the sharpness read from texture mapped in reflection glossines is 0
 	// and cosThetaM is 1 (and consequently tanThetaM2 is 0);
@@ -1008,7 +1340,7 @@ float pow35(float x) {
 /// @param reflectionColor The color of the specular highlight
 /// @param fresnel Dielectric fresnel coefficient
 /// @return Blended reflection color.
-vec3 computeMetallicReflection(vec3 metalColor, vec3 reflectionColor, float fresnel) {
+vec3 computeMetallicReflection(vec3 metalColor, vec3 reflectionColor, vec3 fresnel) {
 	vec3 reflectionDim = reflectionColor * fresnel;
 	return metalColor * (1.0 - reflectionDim) + reflectionDim;
 }
@@ -1032,6 +1364,7 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	vec3 refractionColor = initParams.refractionColor;
 	float refractionAmount = initParams.refractionAmount;
 	bool traceRefractions = initParams.traceRefractions;
+	float fresnelIOR = initParams.fresnelIOR;
 	float refractionIOR = initParams.refractionIOR;
 	bool useFresnel = initParams.useFresnel;
 	bool lockFresnelIOR = initParams.lockFresnelIOR;
@@ -1041,6 +1374,8 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	int brdfType = initParams.brdfType;
 	float sheenGloss = initParams.sheenGlossiness;
 	float coatGloss = initParams.coatGlossiness;
+	float thinFilmThickness = initParams.thinFilmThickness;
+	float thinFilmIOR = initParams.thinFilmIOR;
 
 	VRayMtlContext result;
 	if (initParams.lockFresnelIOR)
@@ -1063,13 +1398,42 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	result.rtermA = 1.0 - 0.5 * (sqrRough / (sqrRough + 0.33));
 	result.rtermB = 0.45 * (sqrRough / (sqrRough + 0.09));
 
-	if (doubleSided && dot(geomNormal, result.e) > 0.0)
+	bool backside = dot(geomNormal, result.e) > 0.0;
+	if (doubleSided && backside)
 		geomNormal = -geomNormal;
 
 	result.geomNormal = geomNormal;
 
+	// If the Fresnel IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
+	if (fresnelIOR > 1e-6 && fresnelIOR < 1.0 && refractionIOR >= 1.0) {
+		fresnelIOR = 1.0 / fresnelIOR;
+	}
+
 	bool internalReflection;
-	float fresnel = getFresnelCoeff(initParams.fresnelIOR, refractionIOR, result.e, geomNormal, useFresnel, internalReflection);
+	vec3 refractDir = computeRefractDir(fresnelIOR, refractionIOR, result.e, geomNormal, internalReflection);
+	float cosIn = -dot(result.e, geomNormal);
+	float cosR = -dot(refractDir, geomNormal);
+
+	// If the Thin Film IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
+	if (thinFilmIOR > 1e-6 && thinFilmIOR < 1.0 && refractionIOR >= 1.0) {
+		thinFilmIOR = 1.0 / thinFilmIOR;
+	}
+
+	vec3 fresnel = vec3(1.0f);
+	if (useFresnel && !internalReflection) {
+		// Compute Fresnel coefficients. For front-facing surfaces use the reflection IOR; on back
+		// surfaces use the refraction IOR so that it matches the internal reflection.
+		float ior = backside ? refractionIOR : fresnelIOR;
+		// For front-facing surfaces, only use the reflection IOR.
+		// For back surfaces, use the refraction IOR.
+		float reflectionIOR = backside ? 1.0f / ior : ior;
+		if (cosIn > 1.0 - 1e-12 || cosR > 1.0 - 1e-12) { // View direction is perpendicular to the surface
+			float f = (reflectionIOR - 1.0) / (reflectionIOR + 1.0);
+			fresnel = vec3(clamp(f * f, 0.0, 1.0));
+		} else {
+			fresnel = getFresnelCoeffWithThinFilm(cosIn, reflectionIOR, thinFilmThickness, thinFilmIOR);
+		}
+	}
 
 	vec3 reflNoFresnel = reflColor * reflAmount * result.opacity;
 	result.refl = reflNoFresnel * fresnel;
@@ -1099,7 +1463,27 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 
 	result.hasCoat = (initParams.coatAmount > 1e-6);
 	if (result.hasCoat) {
-		float coatFresnel = getFresnelCoeff(initParams.coatIOR, refractionIOR, result.e, geomNormal, true, internalReflection);
+		float coatFresnel = 1.0f;
+		if (!internalReflection) {
+			// If the coat IOR is less than 1.0, but the refraction IOR is greater than 1.0, use the inverse because IOR maps are typically 0-1.
+			if (initParams.coatIOR > 1e-6 && initParams.coatIOR < 1.0 && refractionIOR >= 1.0) {
+				initParams.coatIOR = 1.0 / initParams.coatIOR;
+			}
+			
+			// Compute Fresnel coefficients. For front-facing surfaces use the reflection IOR; on back
+			// surfaces use the refraction IOR so that it matches the internal reflection.
+			float ior = backside ? refractionIOR : initParams.coatIOR;
+			// For front-facing surfaces, only use the reflection IOR.
+			// For back surfaces, use the refraction IOR.
+			float reflectionIOR = backside ? 1.0f / ior : ior;
+			if (cosIn > 1.0 - 1e-12 || cosR > 1.0 - 1e-12) { // View direction is perpendicular to the surface
+				float f = (reflectionIOR - 1.0) / (reflectionIOR + 1.0);
+				coatFresnel= clamp(f * f, 0.0, 1.0);
+			} else {
+				coatFresnel = getFresnelCoeff(cosIn, reflectionIOR);
+			}			
+		}
+
 		float coatAmount = initParams.coatAmount;
 		vec3 coatColor = initParams.coatColor * (1.0 - coatFresnel);
 		vec3 coatDim = traceReflections ? ((1.0 - coatAmount) + coatAmount * coatColor) : vec3(1.0);
@@ -2123,6 +2507,8 @@ vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweep
 	initParams.sssOn = false;
 	initParams.sheenAmount = 1.0;
 	initParams.coatIOR = 1.6;
+	initParams.thinFilmThickness = 0.0;
+	initParams.thinFilmIOR = 1.47;
 	// unused yet - corresponds to translucency color in SSS
 	initParams.translucencyColor = vec3(1.0);
 	initParams.sssFwdBackCoeff = 0.0;
