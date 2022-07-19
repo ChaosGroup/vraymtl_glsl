@@ -221,6 +221,7 @@ struct VRayMtlContext {
 	bool hasCoat;
 	mat3 coatNM;
 	mat3 coatINM;
+	float anisotropy;
 };
 
 vec3 sampleBRDF(VRayMtlInitParams params, VRayMtlContext ctx,
@@ -996,6 +997,19 @@ float getGGXBidirectionalShadowingMasking(
 		* getGGXMonodirectionalShadowing(dir, hw, normal, sharpness, gtrGamma);
 }
 
+float getGTRAnisotropy(float anisotropy) {
+	float anisoAbs = abs(anisotropy);
+	if (anisoAbs >= 1e-12f && anisoAbs < 1.0f - 1e-6f) {
+		if (anisotropy > 0.0f) {
+			return 1.0f / (1.0f - anisotropy);
+		} else {
+			return 1.0f + anisotropy;
+		}
+	} else {
+		return 1.0f;
+	}
+}
+
 float getGGXContribution(
 	vec3 view,
 	vec3 dir,
@@ -1003,29 +1017,52 @@ float getGGXContribution(
 	vec3 hl,
 	float sharpness,
 	float gtrGamma,
-	vec3 normal,
+	mat3 nm,
+	float anisotropy,
 	out float partialProb,
-	out float D) {
-	float cosIN = abs(dot(view, normal));
-	float cosON = abs(dot(dir, normal));
+	out float D
+) {
+	float cosIN = abs(dot(view, nm[2]));
+	float cosON = abs(dot(dir, nm[2]));
+	float hn = hl.z;
+	float ho = dot(hw, dir);
 
-	if (cosIN <= 1e-6 || cosON <= 1e-6)
+	if (cosIN <= 1e-6 || cosON <= 1e-6 || hn <= 1e-6f || ho <= 1e-6f)
 		return 0.0;
 
-	float partialBrdf = 0.0;
+	float normalization = 1.0f;
+	vec3 hAnisoLocal, hAniso, lAniso, vAniso, nAniso;
+	if (anisotropy != 0.0f && anisotropy != 1.0f) {
+		hAnisoLocal = vec3(1.0f / anisotropy, anisotropy, 1.0f) * hl;
+		normalization = 1.0f / dot(hAnisoLocal, hAnisoLocal);
+		hAnisoLocal *= sqrt(normalization);
+		normalization = sqr(normalization);
 
-	float hn = hl.z;
-	D = getGGXMicrofacetDistribution(hn, sharpness, gtrGamma);
-	// division by cosON is omitted because we would have to multiply by the same below
-	partialBrdf =
-		0.25 * getGGXBidirectionalShadowingMasking(view, dir, hw, normal, sharpness, gtrGamma) / cosIN;
+		// The new anisotropy computes the shadowing-masking in local space.
+		// The view and light direction are transformed with the inverse compared to the half vector,
+		// because normals are transformed with the inverse transposed of the matrix used to transform the directions.
+		vAniso = view * nm; // multiplying from the left is equivalent to multiplying with inm.
+		vAniso = normalize(vec3(anisotropy, 1.0f / anisotropy, 1.0f) * vAniso);
 
-	if (hn > 0.0) {
-		partialProb = hn;
+		lAniso = dir * nm; // multiplying from the left is equivalent to multiplying with inm.
+		lAniso = normalize(vec3(anisotropy, 1.0f / anisotropy, 1.0f) * lAniso);
 
-		float ho = dot(hw, dir);
-		partialProb *= ho > 0.0 ? 0.25 / ho : 0.0;
+		hAniso = hAnisoLocal;
+		nAniso = vec3(0.0f, 0.0f, 1.0f);
+	} else {
+		hAnisoLocal = hl;
+		hAniso = hw;
+		vAniso = view;
+		lAniso = dir;
+		nAniso = nm[2];
 	}
+
+	D = getGGXMicrofacetDistribution(hAnisoLocal.z, sharpness, gtrGamma) * normalization;
+	// division by cosON is omitted because we would have to multiply by the same below
+	float partialBrdf = 0.25 * getGGXBidirectionalShadowingMasking(vAniso, lAniso, hAniso, nAniso, sharpness, gtrGamma) / cosIN;
+
+	// The probability without the microfacet distribution Dval and V-Ray factor 2pi.
+	partialProb = 0.25f * hn / ho;
 
 	// reduce some multiplications in the final version
 	// partialBrdf *= cosON; - omitted
@@ -1033,28 +1070,23 @@ float getGGXContribution(
 	return partialBrdf;
 }
 
-vec3 getGGXDir(
-	float u, float v, float sharpness, float gtrGamma, vec3 view, mat3 nm, out float prob, out float brdfDivByProb) {
+vec3 getGGXDir(float u, float v, float sharpness, float gtrGamma, vec3 view, mat3 nm, float anisotropy, out float prob, out float brdfDivByProb) {
 	vec3 microNormalLocal = getGGXMicroNormal(u, v, sharpness, gtrGamma);
 	if (microNormalLocal.z < 0.0)
 		return nm[2];
 
-	vec3 microNormal = nm * microNormalLocal;
+	if (anisotropy != 0.0f && anisotropy != 1.0f) {
+		microNormalLocal = normalize(microNormalLocal * vec3(anisotropy, 1.0f / anisotropy, 1.0f));
+	}
 
-	// Compute and keep the length of the half-vector in local space; needed for anisotropy correction
-	float L2 = dot(microNormal, microNormal);
-	float L = sqrt(L2);
-	microNormal /= L;
+	vec3 microNormal = nm * microNormalLocal;
 
 	vec3 dir = reflect(-view, microNormal);
 
-	float Dval = 0.0;
+	float D = 0.0;
 	float partialProb = 0.0;
-	float partialBrdf =
-		getGGXContribution(view, dir, microNormal, microNormalLocal, sharpness, gtrGamma, nm[2], partialProb, Dval);
-	partialProb *= L * L2; // take anisotropy in consideration
-	prob = (Dval >= 1e-6) ? partialProb * Dval * 2.0 * PI
-						  : 1e18; // compute full probability and apply vray specific corrections
+	float partialBrdf = getGGXContribution(view, dir, microNormal, microNormalLocal, sharpness, gtrGamma, nm, anisotropy, partialProb, D);
+	prob = (D >= 1e-6) ? partialProb * D * 2.0 * PI : LARGE_FLOAT; // compute full probability and apply vray specific corrections
 	brdfDivByProb = (partialProb >= 1e-6) ? partialBrdf / partialProb : 0.0;
 	return dir;
 }
@@ -1077,7 +1109,7 @@ vec3 sampleBRDF(
 	} else if (brdfType == 2) {
 		dir = getWardDir(u, v, ctx.roughnessSqr, -ctx.e, ctx.nm);
 	} else /* brdfType==3 */ {
-		dir = getGGXDir(u, v, ctx.roughnessSqr, ctx.gtrGamma, -ctx.e, ctx.nm, rayProb, brdfContrib);
+		dir = getGGXDir(u, v, ctx.roughnessSqr, ctx.gtrGamma, -ctx.e, ctx.nm, ctx.anisotropy, rayProb, brdfContrib);
 	}
 
 	if (dot(dir, geomNormal) < 0.0) {
@@ -1086,8 +1118,7 @@ vec3 sampleBRDF(
 	return dir;
 }
 
-vec3 sampleCoatBRDF(
-	VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
+vec3 sampleCoatBRDF(VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx, int nbSamples, out float rayProb, out float brdfContrib) {
 	vec3 geomNormal = ctx.geomNormal;
 	vec2 uv = rand(ctx, sampleIdx, nbSamples);
 	float u = uv.x, v = uv.y;
@@ -1095,7 +1126,7 @@ vec3 sampleCoatBRDF(
 	vec3 dir = vec3(0.0);
 	rayProb = 1.0;
 	brdfContrib = 1.0;
-	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, rayProb, brdfContrib);
+	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, ctx.anisotropy, rayProb, brdfContrib);
 
 	if (dot(dir, geomNormal) < 0.0) {
 		brdfContrib = 0.0;
@@ -1559,7 +1590,7 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 	result.coatRoughnessSqr *= result.coatRoughnessSqr;
 	result.sheenGloss = sheenGloss;
 	result.gtrGamma = gtrGamma;
-
+	
 	// Set up the normal/inverse normal matrices for BRDFs that support anisotropy
 	vec3 anisoDirection = vec3(0.0, 0.0, 1.0);
 	if (anisoAxis == 0)
@@ -1586,19 +1617,34 @@ VRayMtlContext initVRayMtlContext(VRayMtlInitParams initParams) {
 
 		if (length(cross(base0, base1)) < 1e-6)
 			computeTangentVectors(geomNormal, base0, base1);
-		if (aniso > 0.0) {
-			float a = 1.0 / (1.0 - aniso);
-			base0 *= a;
-			base1 /= a;
+
+		mat3 nnm = mat3(base0, base1, geomNormal);
+
+		if (brdfType == 3) {
+			result.nm = nnm;
+			result.inm = transpose(result.nm);
+			result.anisotropy = getGTRAnisotropy(aniso);
 		} else {
-			float a = 1.0 / (1.0 + aniso);
-			base0 /= a;
-			base1 *= a;
+			// Old anisotropy for the rest of the BRDFs
+			if (aniso > 0.0) {
+				float a = 1.0 / (1.0 - aniso);
+				base0 *= a;
+				base1 /= a;
+			} else {
+				float a = 1.0 / (1.0 + aniso);
+				base0 /= a;
+				base1 *= a;
+			}
+			result.nm = mat3(base0, base1, geomNormal);
+			result.inm = inverse(result.nm);
+			result.anisotropy = 0.0f;
 		}
-		result.nm[0] = base0;
-		result.nm[1] = base1;
-		result.nm[2] = geomNormal;
-		result.inm = inverse(result.nm);
+		// Note: The Phong anisotropy in V-Ray is done differently but it requires storing 2
+		// additional matrices in the context which probably isn't worth doing here.
+		// if (isPhong) {
+		// 	phongNM = result.nm * inverse(nnm);
+		// 	phongINM = inverse(phongNM);
+		// }
 	}
 
 	return result;
@@ -1691,18 +1737,15 @@ vec3 vrayMtlGGX(vec3 lightDir, VRayMtlContext ctx) {
 	float lightNdotL = dot(ctx.geomNormal, lightDir);
 	if (lightNdotL > 1e-6 && cs1 > 1e-6) {
 		vec3 hw = normalize(lightDir - ctx.e);
-		vec3 hn = normalize(ctx.inm * hw);
-		if (hn.z > 1e-3) {
-			float D = getGGXMicrofacetDistribution(hn.z, ctx.roughnessSqr, ctx.gtrGamma);
-			float G =
-				getGGXBidirectionalShadowingMasking(-ctx.e, lightDir, hw, ctx.geomNormal, ctx.roughnessSqr, ctx.gtrGamma);
-			vec3 micron = ctx.nm * hn;
-			float L2 = dot(micron, micron);
-			float anisotropyCorrection = L2 * sqrt(L2);
-			float k = 0.25 * D * G * anisotropyCorrection * PI / cs1; // anisotropy correction
-			if (k > 0.0)
-				return vec3(k);
-		}
+		vec3 hl = normalize(ctx.inm * hw);
+		
+		float D = 0.0f;
+		float partialProb = 0.0f;
+		float partialBrdf = getGGXContribution(-ctx.e, lightDir, hw, hl, ctx.roughnessSqr, ctx.gtrGamma, ctx.nm, ctx.anisotropy, partialProb, D);
+
+		// compute full brdf and probability, and apply vray specific corrections
+		float fullBrdf = partialBrdf * D * PI;
+		return vec3(fullBrdf);
 	}
 	return vec3(0.0);
 }
@@ -2497,7 +2540,7 @@ int getPresetIdx(float sweepFactor) {
 	if (presetIdx >= totalPresets) {
 		presetIdx = 0;
 	}
-	return presetIdx;
+	return presetIdx;	
 }
 
 void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
