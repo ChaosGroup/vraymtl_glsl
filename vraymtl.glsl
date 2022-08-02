@@ -1126,7 +1126,7 @@ vec3 sampleCoatBRDF(VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx,
 	vec3 dir = vec3(0.0);
 	rayProb = 1.0;
 	brdfContrib = 1.0;
-	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, ctx.anisotropy, rayProb, brdfContrib);
+	dir = getGGXDir(u, v, ctx.coatRoughnessSqr, 2.0, -ctx.e, ctx.coatNM, 0.0, rayProb, brdfContrib);
 
 	if (dot(dir, geomNormal) < 0.0) {
 		brdfContrib = 0.0;
