@@ -806,16 +806,12 @@ vec3 getGGXMicroNormal(float uc, float vc, float sharpness, float gtrGamma) {
 
 float getGTR1MicrofacetDistribution(float mz, float sharpness) {
 	float cosThetaM = mz; // dot(microNormal, normal);
-	if (cosThetaM <= 1e-3)
-		return 0.0;
-
 	float cosThetaM2 = sqr(cosThetaM);
-	float tanThetaM2 = (1.0 / cosThetaM2) - 1.0;
 	float sharpness2 = sqr(sharpness);
-	float div = PI * log(sharpness2) * cosThetaM2 * (sharpness2 + tanThetaM2);
+	float div = PI * log(sharpness2) * (1.0 + (sharpness2 - 1.0) * cosThetaM2);
 	// when div<(sharpness2-1.0)*1e-6 no division by zero will occur (the dividend and the divisor are always negative);
 	// div can get 0 in rare situation when the sharpness read from texture mapped in reflection glossines is 0
-	// and cosThetaM is 1 (and consequently tanThetaM2 is 0);
+	// and cosThetaM is 1 (and consequently 1+(sharpness2-1)*cosThetaM2 = 0).
 	float res = (div < (sharpness2 - 1.0) * 1e-6) ? (sharpness2 - 1.0) / div : 0.0;
 
 	return res;
@@ -823,16 +819,13 @@ float getGTR1MicrofacetDistribution(float mz, float sharpness) {
 
 float getGTR2MicrofacetDistribution(float mz, float sharpness) {
 	float cosThetaM = mz; // dot(microNormal, normal);
-	if (cosThetaM <= 1e-3)
-		return 0.0;
-
 	float cosThetaM2 = sqr(cosThetaM);
 	float tanThetaM2 = (1.0 / cosThetaM2) - 1.0;
 	float sharpness2 = sqr(sharpness);
-	float div = PI * sqr(cosThetaM2 * (sharpness2 + tanThetaM2));
+	float div = PI * sqr(1.0 + (sharpness2 - 1.0) * cosThetaM2);
 	// when div>sharpness2*1e-6 no division by zero will occur (the dividend and the divisor are always positive);
 	// div canget0 in rare situation when the sharpness read from texture mapped in reflection glossines is 0
-	// and cosThetaM is 1 (and consequently tanThetaM2 is 0);
+	// and cosThetaM is 1 (and consequently 1+(sharpness2-1)*cosThetaM2 = 0).
 	float res = (div > sharpness2 * 1e-6) ? sharpness2 / div : 0.0;
 
 	return res;
@@ -840,19 +833,16 @@ float getGTR2MicrofacetDistribution(float mz, float sharpness) {
 
 float getGTRMicrofacetDistribution(float mz, float sharpness, float gtrGamma) {
 	float cosThetaM = mz; // dot(microNormal, normal);
-	if (cosThetaM <= 1e-3)
-		return 0.0;
-
 	float cosThetaM2 = sqr(cosThetaM);
 	float tanThetaM2 = (1.0 / cosThetaM2) - 1.0;
 	float sharpness2 = sqr(sharpness);
 	float divisor =
-		PI * (1.0 - pow(sharpness2, 1.0 - gtrGamma)) * pow(cosThetaM2 * (sharpness2 + tanThetaM2), gtrGamma);
+		PI * (1.0 - pow(sharpness2, 1.0 - gtrGamma)) * pow(1.0 + (sharpness2 - 1.0) * cosThetaM2, gtrGamma);
 	float dividend = (gtrGamma - 1.0) * (sharpness2 - 1.0);
 	// when abs(divisor)>abs(dividend)*1e-6 no division by zero will occur
 	// (the dividend and the divisor are always either both positive or both negative);
 	// divisor canget0 in rare situation when the sharpness read from texture mapped in reflection glossines is 0
-	// and cosThetaM is 1 (and consequently tanThetaM2 is 0);
+	// and cosThetaM is 1 (and consequently 1+(sharpness2-1)*cosThetaM2 = 0).
 	float res = (abs(divisor) > abs(dividend) * 1e-6) ? dividend / divisor : 0.0;
 
 	return res;
