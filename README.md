@@ -2,7 +2,7 @@
 
 ## General Information ##
 
-vraymtl.glsl contains a GLSL implementation of the V-Ray 5 VRayMtl done in a single fragment shader pass.
+vraymtl.glsl contains a GLSL implementation of the V-Ray 6 VRayMtl done in a single fragment shader pass.
 This implementation can be run directly in either shadertoy.com or Visual Studio Code using the ShaderToy extension.
 
 ## Quality and Performance ##
@@ -21,7 +21,7 @@ Look at the mainImage function for how to set up a VRayMtlInitParams struct, set
 ## Supported features ##
 
 The implementation supports the following major features:
-- All of the layers (diffuse, reflection, refraction, sheen, coat) in V-Ray 5's VRayMtl are supported and react to direct lighting (from lights such as point or directional) and indirect lighting (from environment)
+- All of the layers (diffuse, reflection, refraction, sheen, coat, thin film) in V-Ray 6's VRayMtl are supported and react to direct lighting (from lights such as point or directional) and indirect lighting (from environment)
 - Glossy reflections and refractions
 - Metalness
 - Anisotropic reflections
