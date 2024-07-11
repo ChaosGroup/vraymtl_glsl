@@ -1198,7 +1198,7 @@ float sheenShadowingMasking(float cosIN, float cosON, float roughness) {
 /// VRay's probability transformation (2pi multiplication)
 /// Glossiness must be in the [0, 1) range. In theory the result is undefined for glossiness = 1
 /// but in practice the highlight disappears and we check for that as soon as we read the glossiness texture.
-float sheenProbability(vec3 viewDir, vec3 lightDir, vec3 normal, float glossiness) {
+float sheenBRDF(vec3 viewDir, vec3 lightDir, vec3 normal, float glossiness) {
 	vec3 incomingDir = -viewDir;
 
 	float cosIN = min(1.0, dot(incomingDir, normal));
@@ -1335,7 +1335,7 @@ vec3 sampleSheenBRDF(VRayMtlInitParams params, VRayMtlContext ctx, int sampleIdx
 	vec3 dir = localToWorld * getSphereDir(uv.x, uv.y);
 	rayProb = INV_2PI;
 	float glossyFresnelCoeff = getConductorFresnel(-dot(ctx.e, normalize(dir - ctx.e)), SHEEN_N, SHEEN_K);
-	brdfContrib = sheenProbability(ctx.e, dir, ctx.geomNormal, ctx.sheenGloss);
+	brdfContrib = sheenBRDF(ctx.e, dir, ctx.geomNormal, ctx.sheenGloss);
 	brdfContrib *= glossyFresnelCoeff;
 	return dir;
 }
@@ -1814,7 +1814,7 @@ vec3 computeDirectSheenContribution(VRayMtlInitParams params, VRayMtlContext ctx
 
 	// Use fixed IOR for sheen
 	float glossyFresnelCoeff = getConductorFresnel(-dot(ctx.e, normalize(lightDir - ctx.e)), SHEEN_N, SHEEN_K);
-	float k = sheenProbability(ctx.e, lightDir, ctx.geomNormal, ctx.sheenGloss);
+	float k = sheenBRDF(ctx.e, lightDir, ctx.geomNormal, ctx.sheenGloss);
 	res = vec3(k) * glossyFresnelCoeff * 0.5;
 
 	return res;
